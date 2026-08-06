@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DCInside User Block
 // @namespace    https://github.com/jupia389-rgb/suking
-// @version      1.0.1
-// @description  디시인사이드 게시글·댓글 작성자 차단 및 차단 목록 관리
+// @version      1.1.0
+// @description  디시인사이드 모바일/PC 게시글·댓글 작성자 차단 (차단 항목 완전 숨김)
 // @match        https://gall.dcinside.com/*
 // @match        https://m.dcinside.com/*
 // @run-at       document-end
@@ -15,55 +15,114 @@
 (() => {
   'use strict';
 
-  const KEY = 'dcub_users_v1';
-  const OPT_KEY = 'dcub_options_v1';
-  const BLOCK_BTN = 'dcub-user-btn';
-  const HIDDEN = 'dcub-hidden';
+  const STORE_KEY = 'dcub_users_v1';
+  const BLOCK_BUTTON_CLASS = 'dcub-user-btn';
+  const HIDDEN_CLASS = 'dcub-hidden';
+  const DONE_ATTRIBUTE = 'data-dcub-done';
+  const isMobile = location.hostname === 'm.dcinside.com';
 
-  const read = (key, fallback) => {
+  let blockedUsers = load(STORE_KEY, []);
+  let scanTimer = 0;
+
+  function load(key, fallback) {
     try {
       const raw = typeof GM_getValue === 'function'
         ? GM_getValue(key, '')
         : localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : fallback;
-    } catch (_) {
+      if (!raw) return fallback;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      return parsed ?? fallback;
+    } catch (error) {
+      console.warn('[DCUB] 저장 데이터 읽기 실패:', error);
       return fallback;
     }
-  };
+  }
 
-  const write = (key, value) => {
-    const raw = JSON.stringify(value);
+  function save() {
+    const raw = JSON.stringify(blockedUsers);
     try {
-      if (typeof GM_setValue === 'function') GM_setValue(key, raw);
-      else localStorage.setItem(key, raw);
-    } catch (_) {}
-  };
+      if (typeof GM_setValue === 'function') GM_setValue(STORE_KEY, raw);
+      else localStorage.setItem(STORE_KEY, raw);
+    } catch (error) {
+      console.warn('[DCUB] 저장 실패:', error);
+    }
+  }
 
-  let blocked = read(KEY, []);
-  let options = Object.assign({ mode: 'hide' }, read(OPT_KEY, {}));
-  let scanTimer = 0;
+  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
 
-  const text = value => String(value || '').replace(/\s+/g, ' ').trim();
-  const html = value => String(value).replace(/[&<>"']/g, ch => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[ch]);
+  const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[char]);
 
-  function getUser(author) {
-    if (!author) return null;
+  function firstAttribute(root, names) {
+    if (!root) return '';
 
-    const d = author.dataset || {};
-    const raw = text(author.textContent);
-    const nick = text(d.nick || author.getAttribute('data-nick') || raw.replace(/\([\d.*:]+\)/g, ''));
-    const ip = text(d.ip || author.getAttribute('data-ip') || '').replace(/[()]/g, '');
-    let uid = text(d.uid || d.userId || author.getAttribute('data-uid') || author.getAttribute('data-user-id'));
-
-    if (!uid) {
-      const source = `${author.getAttribute('href') || ''} ${author.getAttribute('onclick') || ''}`;
-      const match = source.match(/gallog\.dcinside\.com\/([^/?'" )]+)/i);
-      if (match) uid = decodeURIComponent(match[1]);
+    const nodes = [root];
+    if (root.querySelectorAll) {
+      root.querySelectorAll(names.map(name => `[${name}]`).join(',')).forEach(node => nodes.push(node));
     }
 
-    if (!nick && !ip && !uid) return null;
+    for (const node of nodes) {
+      for (const name of names) {
+        const value = normalize(node.getAttribute?.(name));
+        if (value) return value;
+      }
+    }
+    return '';
+  }
+
+  function extractGallogId(root) {
+    if (!root) return '';
+
+    const nodes = [root];
+    root.querySelectorAll?.('a[href], [onclick]').forEach(node => nodes.push(node));
+
+    for (const node of nodes) {
+      const source = `${node.getAttribute?.('href') || ''} ${node.getAttribute?.('onclick') || ''}`;
+      const match = source.match(/gallog\.dcinside\.com\/([^/?#'" )]+)/i);
+      if (match) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch (_) {
+          return match[1];
+        }
+      }
+    }
+    return '';
+  }
+
+  function extractIP(raw, root) {
+    const stored = firstAttribute(root, ['data-ip', 'data-user-ip', 'ip']);
+    if (stored) return stored.replace(/[()[\]\s]/g, '');
+
+    const match = String(raw || '').match(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)/);
+    return match ? match[1] : '';
+  }
+
+  function cleanNickname(raw) {
+    return normalize(raw)
+      .replace(/^글쓴\s+/, '')
+      .replace(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)\s*$/, '')
+      .replace(/\s*(차단|해제)\s*$/, '')
+      .trim();
+  }
+
+  function getUser(author, container) {
+    if (!author) return null;
+
+    const context = container || author;
+    const raw = normalize(author.textContent);
+    const nickFromData = firstAttribute(author, ['data-nick', 'data-name', 'data-user-name']);
+    const uid = firstAttribute(context, ['data-uid', 'data-user-id', 'data-userid']) || extractGallogId(context);
+    const ip = extractIP(raw, context);
+    const nick = cleanNickname(nickFromData || raw);
+
+    if (!uid && !ip && !nick) return null;
+
     return {
       type: uid ? 'uid' : ip ? 'ip' : 'nick',
       value: uid || ip || nick,
@@ -73,67 +132,94 @@
     };
   }
 
-  function matches(item, user) {
-    return item.type === 'uid' ? !!user.uid && item.value === user.uid
-      : item.type === 'ip' ? !!user.ip && item.value === user.ip
-      : !!user.nick && item.value === user.nick;
+  function sameUser(saved, current) {
+    if (!saved || !current) return false;
+    if (saved.type === 'uid') return Boolean(current.uid) && saved.value === current.uid;
+    if (saved.type === 'ip') return Boolean(current.ip) && saved.value === current.ip;
+    return Boolean(current.nick) && saved.value === current.nick;
   }
 
-  const findIndex = user => blocked.findIndex(item => matches(item, user));
+  const blockedIndex = user => blockedUsers.findIndex(saved => sameUser(saved, user));
 
-  function save() {
-    write(KEY, blocked);
-  }
+  function addBlockedUser(user) {
+    if (!user || blockedIndex(user) >= 0) return;
 
-  function toast(message) {
-    document.getElementById('dcub-toast')?.remove();
-    const el = document.createElement('div');
-    el.id = 'dcub-toast';
-    el.textContent = message;
-    document.body.appendChild(el);
-    setTimeout(() => el.remove(), 1700);
-  }
-
-  function addUser(user) {
-    if (!user || findIndex(user) >= 0) return;
-    blocked.unshift({
+    blockedUsers.unshift({
       type: user.type,
       value: user.value,
       nick: user.nick,
-      time: Date.now()
+      createdAt: Date.now()
     });
+
     save();
     scan(true);
+    renderPanelList();
     toast(`${user.nick} 차단 완료`);
   }
 
-  function removeUser(index) {
-    if (index < 0 || index >= blocked.length) return;
-    const old = blocked.splice(index, 1)[0];
+  function removeBlockedUser(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= blockedUsers.length) return;
+
+    const removed = blockedUsers.splice(index, 1)[0];
     save();
     scan(true);
-    renderList();
-    toast(`${old.nick || old.value} 차단 해제`);
+    renderPanelList();
+    toast(`${removed.nick || removed.value} 차단 해제`);
   }
 
-  function containers() {
+  function contentContainers() {
     const selectors = [
       'tr.ub-content',
       '.gall_list tbody tr[data-no]',
       'li.ub-content',
-      'li[id^="comment_"]',
-      '.cmt_list > li',
-      '.reply_list > li',
+      '.cmt_list > li[id^="comment_"]',
+      '.reply_list > li[id^="comment_"]',
       '.gall-detail-lst > li',
-      '.comment-lst > li',
-      '.reply-lst > li'
+      '#view_next > li',
+      '.all-comment-lst > li[id^="comment_cnt_"]',
+      '.comment-lst > li[id^="comment_"]',
+      '.reply-lst > li[id^="comment_"]'
     ];
-    const set = new Set();
-    selectors.forEach(selector => document.querySelectorAll(selector).forEach(el => set.add(el)));
-    return [...set];
+
+    const result = new Set();
+    selectors.forEach(selector => {
+      document.querySelectorAll(selector).forEach(element => result.add(element));
+    });
+    return [...result];
   }
 
-  function authorIn(box) {
+  function mobileListAuthor(container) {
+    if (!container.matches('.gall-detail-lst > li, #view_next > li')) return null;
+    return container.querySelector(':scope > ul.ginfo > li:nth-child(2)')
+      || container.querySelector('ul.ginfo > li:nth-child(2)');
+  }
+
+  function commentTextAuthor(container) {
+    if (!container.matches('.all-comment-lst > li[id^="comment_cnt_"]')) return null;
+
+    const lines = String(container.innerText || '')
+      .split(/\n+/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    const firstLine = lines[0] || '';
+    if (!/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)/.test(firstLine)) return null;
+
+    let marker = container.querySelector(':scope > .dcub-text-author');
+    if (!marker) {
+      marker = document.createElement('span');
+      marker.className = 'dcub-text-author';
+      marker.textContent = firstLine;
+      marker.style.display = 'none';
+      container.prepend(marker);
+    }
+    return marker;
+  }
+
+  function authorIn(container) {
+    const mobileAuthor = mobileListAuthor(container);
+    if (mobileAuthor) return mobileAuthor;
+
     const selectors = [
       '.gall_writer[data-nick]',
       '.gall_writer[data-uid]',
@@ -141,210 +227,401 @@
       '.cmt_nickbox .gall_writer',
       '.cmt_nickbox .nickname',
       '.cmt_nickbox .nick_name',
+      '[data-nick]',
+      '[data-uid]',
+      '[data-ip]',
       '.gall_writer',
-      '.nickname[data-nick]',
-      '.nick_name[data-nick]',
       '.nickname',
       '.nick_name',
+      '.comment-nick',
+      '.user-nick',
       '.user_info'
     ];
+
     for (const selector of selectors) {
-      const found = box.querySelector(selector);
-      if (found && (found.dataset?.nick || found.dataset?.uid || found.dataset?.ip || text(found.textContent))) return found;
-    }
-    return null;
-  }
-
-  function restore(box) {
-    box.classList.remove(HIDDEN);
-    box.removeAttribute('data-dcub-blocked');
-    box.querySelector(':scope > .dcub-fold')?.remove();
-    [...box.children].forEach(child => {
-      if ('dcubDisplay' in child.dataset) {
-        child.style.display = child.dataset.dcubDisplay;
-        delete child.dataset.dcubDisplay;
-      }
-    });
-  }
-
-  function hide(box, user) {
-    box.dataset.dcubBlocked = '1';
-
-    if (options.mode === 'hide') {
-      box.classList.add(HIDDEN);
-      return;
+      const found = container.querySelector(selector);
+      if (found && normalize(found.textContent)) return found;
     }
 
-    box.classList.remove(HIDDEN);
-    [...box.children].forEach(child => {
-      if (child.classList.contains('dcub-fold')) return;
-      if (!('dcubDisplay' in child.dataset)) child.dataset.dcubDisplay = child.style.display || '';
-      child.style.display = 'none';
-    });
-
-    let fold = box.querySelector(':scope > .dcub-fold');
-    if (!fold) {
-      fold = document.createElement(box.tagName === 'TR' ? 'td' : 'div');
-      fold.className = 'dcub-fold';
-      if (box.tagName === 'TR') fold.colSpan = Math.max(box.children.length, 1);
-      box.appendChild(fold);
-    }
-
-    fold.innerHTML = `<span>${html(user.nick)} 사용자의 글/댓글을 차단했습니다.</span><button type="button">이번만 보기</button>`;
-    fold.querySelector('button').onclick = event => {
-      event.preventDefault();
-      box.dataset.dcubOnce = '1';
-      restore(box);
-    };
+    return commentTextAuthor(container);
   }
 
-  function addButton(author, user) {
-    const parent = author.closest('.gall_writer, .cmt_nickbox') || author.parentElement;
-    if (!parent || parent.querySelector(`:scope > .${BLOCK_BTN}`)) return;
+  function buttonHost(author, container) {
+    if (container.matches('.gall-detail-lst > li, #view_next > li')) return author;
+    if (container.matches('.all-comment-lst > li[id^="comment_cnt_"]')) {
+      return container.querySelector('.comment-info, .comment_user, .user-info, .nick-box') || container;
+    }
+    return author.closest('.gall_writer, .cmt_nickbox') || author.parentElement || author;
+  }
+
+  function addBlockButton(author, container, user) {
+    const host = buttonHost(author, container);
+    if (!host || host.querySelector(`:scope > .${BLOCK_BUTTON_CLASS}`)) return;
 
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = BLOCK_BTN;
-    button.textContent = findIndex(user) >= 0 ? '해제' : '차단';
-    button.onclick = event => {
+    button.className = BLOCK_BUTTON_CLASS;
+    button.textContent = blockedIndex(user) >= 0 ? '해제' : '차단';
+    button.setAttribute('aria-label', `${user.nick} ${button.textContent}`);
+
+    button.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      const current = getUser(author) || user;
-      const index = findIndex(current);
-      if (index >= 0) removeUser(index);
-      else addUser(current);
-    };
-    parent.appendChild(button);
+      event.stopImmediatePropagation();
+
+      const currentUser = getUser(author, container) || user;
+      const index = blockedIndex(currentUser);
+      if (index >= 0) removeBlockedUser(index);
+      else addBlockedUser(currentUser);
+    }, true);
+
+    host.appendChild(button);
   }
 
-  function process(box, force) {
-    if (!force && box.dataset.dcubDone === '1') return;
-    box.dataset.dcubDone = '1';
+  function processContainer(container, force = false) {
+    if (!force && container.getAttribute(DONE_ATTRIBUTE) === '1') return;
+    container.setAttribute(DONE_ATTRIBUTE, '1');
 
-    const author = authorIn(box);
-    const user = getUser(author);
+    const author = authorIn(container);
+    const user = getUser(author, container);
     if (!author || !user) return;
 
-    const index = findIndex(user);
-    if (index >= 0 && box.dataset.dcubOnce !== '1') hide(box, user);
-    else if (index < 0) {
-      delete box.dataset.dcubOnce;
-      restore(box);
-    }
+    const isBlocked = blockedIndex(user) >= 0;
+    container.classList.toggle(HIDDEN_CLASS, isBlocked);
 
-    const parent = author.closest('.gall_writer, .cmt_nickbox') || author.parentElement;
-    parent?.querySelector(`:scope > .${BLOCK_BTN}`)?.remove();
-    addButton(author, user);
+    const host = buttonHost(author, container);
+    host?.querySelector(`:scope > .${BLOCK_BUTTON_CLASS}`)?.remove();
+
+    if (!isBlocked) addBlockButton(author, container, user);
+  }
+
+  function articleTargets() {
+    const targets = [];
+
+    document.querySelectorAll('.gallview-tit-box').forEach(container => {
+      const author = container.querySelector('.ginfo2 > li:first-child');
+      if (author) targets.push({ container, author });
+    });
+
+    document.querySelectorAll('.gallview_head').forEach(container => {
+      const author = container.querySelector('.gall_writer');
+      if (author) targets.push({ container, author });
+    });
+
+    return targets;
+  }
+
+  function processArticleTargets() {
+    articleTargets().forEach(({ container, author }) => {
+      const user = getUser(author, container);
+      if (!user) return;
+
+      const host = author;
+      host.querySelector(`:scope > .${BLOCK_BUTTON_CLASS}`)?.remove();
+      addBlockButton(author, container, user);
+    });
   }
 
   function scan(force = false) {
-    containers().forEach(box => process(box, force));
+    contentContainers().forEach(container => processContainer(container, force));
+    processArticleTargets();
+
+    document.querySelectorAll('.block-disable').forEach(element => {
+      element.classList.add(HIDDEN_CLASS);
+    });
   }
 
   function scheduleScan() {
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => scan(), 100);
+    scanTimer = window.setTimeout(() => scan(), 80);
   }
 
-  function renderList() {
+  function toast(message) {
+    document.getElementById('dcub-toast')?.remove();
+    const element = document.createElement('div');
+    element.id = 'dcub-toast';
+    element.textContent = message;
+    document.body.appendChild(element);
+    window.setTimeout(() => element.remove(), 1700);
+  }
+
+  function renderPanelList() {
     const list = document.querySelector('#dcub-panel .dcub-list');
     if (!list) return;
-    if (!blocked.length) {
+
+    if (!blockedUsers.length) {
       list.innerHTML = '<div class="dcub-empty">차단된 사용자가 없습니다.</div>';
       return;
     }
-    list.innerHTML = blocked.map((item, index) => `
+
+    list.innerHTML = blockedUsers.map((item, index) => `
       <div class="dcub-item">
-        <div><b>${html(item.nick || item.value)}</b><small>${html(item.type.toUpperCase())}: ${html(item.value)}</small></div>
+        <div>
+          <b>${escapeHTML(item.nick || item.value)}</b>
+          <small>${escapeHTML(item.type.toUpperCase())}: ${escapeHTML(item.value)}</small>
+        </div>
         <button type="button" data-index="${index}">해제</button>
-      </div>`).join('');
+      </div>
+    `).join('');
+
     list.querySelectorAll('[data-index]').forEach(button => {
-      button.onclick = () => removeUser(Number(button.dataset.index));
+      button.addEventListener('click', () => removeBlockedUser(Number(button.dataset.index)));
     });
   }
 
-  function makeUI() {
+  function createUI() {
+    if (document.getElementById('dcub-open')) return;
+
     const opener = document.createElement('button');
     opener.id = 'dcub-open';
     opener.type = 'button';
     opener.textContent = '차단';
+    opener.title = '차단 목록 관리';
 
     const panel = document.createElement('div');
     panel.id = 'dcub-panel';
     panel.innerHTML = `
       <div class="dcub-box">
-        <header><b>디시 유저 차단</b><button type="button" class="dcub-close">×</button></header>
-        <section class="dcub-option">
-          <label><input type="radio" name="dcub-mode" value="hide"> 완전히 숨기기</label>
-          <label><input type="radio" name="dcub-mode" value="fold"> 접어서 표시</label>
-        </section>
+        <header>
+          <b>디시 유저 차단</b>
+          <button type="button" class="dcub-close" aria-label="닫기">×</button>
+        </header>
+        <div class="dcub-note">차단한 사용자의 게시글과 댓글은 흔적 없이 완전히 숨겨집니다.</div>
         <div class="dcub-list"></div>
         <footer><button type="button" class="dcub-clear">전체 해제</button></footer>
-      </div>`;
+      </div>
+    `;
 
     document.body.append(opener, panel);
-    opener.onclick = () => {
-      renderList();
+
+    opener.addEventListener('click', () => {
+      renderPanelList();
       panel.classList.add('open');
-    };
-    panel.querySelector('.dcub-close').onclick = () => panel.classList.remove('open');
-    panel.onclick = event => {
-      if (event.target === panel) panel.classList.remove('open');
-    };
-    panel.querySelectorAll('[name="dcub-mode"]').forEach(input => {
-      input.checked = input.value === options.mode;
-      input.onchange = () => {
-        options.mode = input.value;
-        write(OPT_KEY, options);
-        scan(true);
-      };
     });
-    panel.querySelector('.dcub-clear').onclick = () => {
-      if (!blocked.length || !confirm('차단 목록을 전부 삭제하시겠습니까?')) return;
-      blocked = [];
+
+    panel.querySelector('.dcub-close').addEventListener('click', () => panel.classList.remove('open'));
+    panel.addEventListener('click', event => {
+      if (event.target === panel) panel.classList.remove('open');
+    });
+
+    panel.querySelector('.dcub-clear').addEventListener('click', () => {
+      if (!blockedUsers.length || !confirm('차단 목록을 전부 삭제하시겠습니까?')) return;
+      blockedUsers = [];
       save();
       scan(true);
-      renderList();
-    };
+      renderPanelList();
+    });
   }
 
-  function style() {
-    const el = document.createElement('style');
-    el.textContent = `
-      .${HIDDEN}{display:none!important}
-      .${BLOCK_BTN}{all:unset!important;display:inline-block!important;margin-left:4px!important;padding:0 4px!important;border:1px solid #aaa!important;border-radius:3px!important;background:#fff!important;color:#777!important;font-size:10px!important;line-height:16px!important;cursor:pointer!important;vertical-align:middle!important}
-      .${BLOCK_BTN}:hover{border-color:#d33!important;color:#d33!important}
-      .dcub-fold{padding:9px 12px!important;background:#f4f4f4!important;color:#777!important;font-size:12px!important}
-      .dcub-fold button{margin-left:8px!important}
-      #dcub-open{position:fixed!important;right:15px!important;bottom:18px!important;z-index:2147483645!important;width:44px!important;height:44px!important;border:0!important;border-radius:50%!important;background:#3b4890!important;color:#fff!important;font-weight:700!important;cursor:pointer!important;box-shadow:0 3px 12px #0005!important}
-      #dcub-panel{display:none;position:fixed!important;inset:0!important;z-index:2147483646!important;background:#0008!important;font-family:Arial,sans-serif!important}
-      #dcub-panel.open{display:block!important}
-      .dcub-box{position:absolute!important;left:50%!important;top:50%!important;transform:translate(-50%,-50%)!important;width:min(92vw,420px)!important;max-height:80vh!important;overflow:hidden!important;border-radius:10px!important;background:#fff!important;color:#222!important;box-shadow:0 12px 40px #0007!important}
-      .dcub-box header,.dcub-box footer{display:flex!important;align-items:center!important;justify-content:space-between!important;padding:13px 15px!important;border-bottom:1px solid #ddd!important}
-      .dcub-box footer{justify-content:flex-end!important;border-top:1px solid #ddd!important;border-bottom:0!important}
-      .dcub-close{border:0!important;background:none!important;font-size:24px!important;cursor:pointer!important}
-      .dcub-option{display:flex!important;gap:12px!important;padding:12px 15px!important;border-bottom:1px solid #eee!important;font-size:13px!important}
-      .dcub-list{max-height:52vh!important;overflow:auto!important;padding:5px 15px!important}
-      .dcub-item{display:flex!important;justify-content:space-between!important;align-items:center!important;gap:10px!important;padding:9px 0!important;border-bottom:1px solid #eee!important;font-size:13px!important}
-      .dcub-item small{display:block!important;margin-top:2px!important;color:#888!important}
-      .dcub-empty{padding:26px 0!important;text-align:center!important;color:#888!important}
-      #dcub-toast{position:fixed!important;left:50%!important;bottom:72px!important;transform:translateX(-50%)!important;z-index:2147483647!important;padding:9px 14px!important;border-radius:7px!important;background:#111e!important;color:#fff!important;font-size:13px!important}
-      @media(prefers-color-scheme:dark){.dcub-box{background:#252525!important;color:#eee!important}.dcub-box header,.dcub-box footer,.dcub-option,.dcub-item{border-color:#444!important}.dcub-fold{background:#292929!important;color:#aaa!important}}
+  function injectStyle() {
+    if (document.getElementById('dcub-style')) return;
+
+    const style = document.createElement('style');
+    style.id = 'dcub-style';
+    style.textContent = `
+      .${HIDDEN_CLASS}, .block-disable { display: none !important; }
+
+      .${BLOCK_BUTTON_CLASS} {
+        all: unset !important;
+        box-sizing: border-box !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin-left: 5px !important;
+        padding: 0 5px !important;
+        min-width: 30px !important;
+        height: 18px !important;
+        border: 1px solid #9ca1b2 !important;
+        border-radius: 4px !important;
+        background: #fff !important;
+        color: #586080 !important;
+        font-size: 10px !important;
+        font-weight: 600 !important;
+        line-height: 18px !important;
+        vertical-align: middle !important;
+        cursor: pointer !important;
+        white-space: nowrap !important;
+        position: relative !important;
+        z-index: 5 !important;
+      }
+
+      .gall-detail-lst > li .ginfo > li:nth-child(2),
+      #view_next > li .ginfo > li:nth-child(2),
+      .gallview-tit-box .ginfo2 > li:first-child {
+        overflow: visible !important;
+        white-space: nowrap !important;
+      }
+
+      .all-comment-lst > li[id^="comment_cnt_"] > .${BLOCK_BUTTON_CLASS} {
+        float: right !important;
+        margin: 0 0 4px 6px !important;
+      }
+
+      #dcub-open {
+        position: fixed !important;
+        right: 14px !important;
+        bottom: 72px !important;
+        z-index: 2147483645 !important;
+        width: 44px !important;
+        height: 44px !important;
+        border: 0 !important;
+        border-radius: 50% !important;
+        background: #3b4890 !important;
+        color: #fff !important;
+        font-size: 12px !important;
+        font-weight: 700 !important;
+        box-shadow: 0 3px 12px rgba(0,0,0,.3) !important;
+        cursor: pointer !important;
+      }
+
+      #dcub-panel {
+        display: none;
+        position: fixed !important;
+        inset: 0 !important;
+        z-index: 2147483646 !important;
+        background: rgba(0,0,0,.52) !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif !important;
+      }
+
+      #dcub-panel.open { display: block !important; }
+
+      #dcub-panel .dcub-box {
+        position: absolute !important;
+        top: 50% !important;
+        left: 50% !important;
+        transform: translate(-50%, -50%) !important;
+        width: min(92vw, 420px) !important;
+        max-height: 82vh !important;
+        overflow: hidden !important;
+        border-radius: 12px !important;
+        background: #fff !important;
+        color: #222 !important;
+        box-shadow: 0 12px 40px rgba(0,0,0,.4) !important;
+      }
+
+      #dcub-panel header,
+      #dcub-panel footer {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        padding: 13px 15px !important;
+        border-bottom: 1px solid #ddd !important;
+      }
+
+      #dcub-panel footer {
+        justify-content: flex-end !important;
+        border-top: 1px solid #ddd !important;
+        border-bottom: 0 !important;
+      }
+
+      #dcub-panel .dcub-close {
+        border: 0 !important;
+        background: transparent !important;
+        color: inherit !important;
+        font-size: 24px !important;
+        cursor: pointer !important;
+      }
+
+      #dcub-panel .dcub-note {
+        padding: 10px 15px !important;
+        border-bottom: 1px solid #eee !important;
+        color: #777 !important;
+        font-size: 12px !important;
+        line-height: 1.45 !important;
+      }
+
+      #dcub-panel .dcub-list {
+        max-height: 52vh !important;
+        overflow-y: auto !important;
+        padding: 5px 15px !important;
+      }
+
+      #dcub-panel .dcub-item {
+        display: flex !important;
+        align-items: center !important;
+        justify-content: space-between !important;
+        gap: 10px !important;
+        padding: 10px 0 !important;
+        border-bottom: 1px solid #eee !important;
+        font-size: 13px !important;
+      }
+
+      #dcub-panel .dcub-item small {
+        display: block !important;
+        margin-top: 2px !important;
+        color: #888 !important;
+      }
+
+      #dcub-panel .dcub-item button,
+      #dcub-panel .dcub-clear {
+        padding: 5px 8px !important;
+        border: 1px solid #aaa !important;
+        border-radius: 5px !important;
+        background: #fff !important;
+        color: #444 !important;
+        cursor: pointer !important;
+      }
+
+      #dcub-panel .dcub-empty {
+        padding: 28px 0 !important;
+        color: #888 !important;
+        text-align: center !important;
+      }
+
+      #dcub-toast {
+        position: fixed !important;
+        left: 50% !important;
+        bottom: 126px !important;
+        transform: translateX(-50%) !important;
+        z-index: 2147483647 !important;
+        padding: 9px 14px !important;
+        border-radius: 8px !important;
+        background: rgba(20,20,20,.92) !important;
+        color: #fff !important;
+        font-size: 13px !important;
+        white-space: nowrap !important;
+        pointer-events: none !important;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        .${BLOCK_BUTTON_CLASS} {
+          background: #303238 !important;
+          color: #d8d8df !important;
+          border-color: #686b76 !important;
+        }
+        #dcub-panel .dcub-box { background: #252525 !important; color: #eee !important; }
+        #dcub-panel header,
+        #dcub-panel footer,
+        #dcub-panel .dcub-note,
+        #dcub-panel .dcub-item { border-color: #444 !important; }
+        #dcub-panel .dcub-item button,
+        #dcub-panel .dcub-clear { background: #333 !important; color: #eee !important; border-color: #666 !important; }
+      }
     `;
-    document.documentElement.appendChild(el);
+
+    document.documentElement.appendChild(style);
   }
 
   function init() {
-    if (!document.body) return document.addEventListener('DOMContentLoaded', init, { once: true });
-    style();
-    makeUI();
-    scan();
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', init, { once: true });
+      return;
+    }
 
-    new MutationObserver(mutations => {
-      if (mutations.some(m => [...m.addedNodes].some(node => node.nodeType === 1))) scheduleScan();
-    }).observe(document.documentElement, { childList: true, subtree: true });
+    injectStyle();
+    createUI();
+    scan(true);
 
-    setInterval(scan, 3000);
+    const observer = new MutationObserver(mutations => {
+      if (mutations.some(mutation => [...mutation.addedNodes].some(node => node.nodeType === 1))) {
+        scheduleScan();
+      }
+    });
+
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.setInterval(() => scan(), isMobile ? 1500 : 3000);
+
+    console.info('[DCUB] v1.1.0 실행됨');
   }
 
   init();
