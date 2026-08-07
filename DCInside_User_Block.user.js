@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         DCInside User Block
 // @namespace    https://github.com/jupia389-rgb/suking
-// @version      1.4.0
-// @description  디시인사이드 모바일/PC 사용자 차단 (화면에서 작성자 선택, 사이트 푸터 설정 버튼)
+// @version      1.5.0
+// @description  디시인사이드 모바일/PC 사용자 차단 (모바일 반고닉 ID 자동 조회)
 // @match        https://gall.dcinside.com/*
 // @match        https://m.dcinside.com/*
 // @run-at       document-end
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @connect      gall.dcinside.com
 // @downloadURL  https://raw.githubusercontent.com/jupia389-rgb/suking/main/DCInside_User_Block.user.js
 // @updateURL    https://raw.githubusercontent.com/jupia389-rgb/suking/main/DCInside_User_Block.user.js
 // ==/UserScript==
@@ -51,10 +53,16 @@
     '.user_info'
   ];
 
+  const remotePostCache = new Map();
+  const remoteListCache = new Map();
+  const remoteCommentCache = new Map();
+
   let blockedUsers = load(STORE_KEY, []);
   let scanTimer = 0;
   let selectionMode = false;
+  let selectionBusy = false;
   let selectionTimeout = 0;
+  let enrichmentTimer = 0;
 
   function load(key, fallback) {
     try {
@@ -90,6 +98,45 @@
     '"': '&quot;',
     "'": '&#39;'
   })[char]);
+
+  function cookie(name) {
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  function requestText(method, url, body = null, headers = {}) {
+    if (typeof GM_xmlhttpRequest === 'function') {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method,
+          url,
+          data: body,
+          headers,
+          timeout: 15000,
+          anonymous: false,
+          onload: response => {
+            if (response.status >= 200 && response.status < 400) {
+              resolve(response.responseText);
+            } else {
+              reject(new Error(`HTTP ${response.status}`));
+            }
+          },
+          onerror: () => reject(new Error('네트워크 요청 실패')),
+          ontimeout: () => reject(new Error('요청 시간 초과'))
+        });
+      });
+    }
+
+    return fetch(url, {
+      method,
+      body,
+      headers,
+      credentials: 'include'
+    }).then(response => {
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.text();
+    });
+  }
 
   function firstAttribute(root, names) {
     if (!root) return '';
@@ -179,17 +226,20 @@
   }
 
   const isBlocked = user => blockedUsers.some(item => matchesBlock(item, user));
+  const hasUidBlocks = () => blockedUsers.some(item => item.type === 'uid');
 
   function selectedUserEntry(user) {
-    if (user.uid) {
+    if (user?.uid) {
       return {
         type: 'uid',
         value: user.uid,
-        label: user.nick && user.nick !== user.uid ? `${user.nick} (@${user.uid})` : `@${user.uid}`
+        label: user.nick && user.nick !== user.uid
+          ? `${user.nick} (@${user.uid})`
+          : `@${user.uid}`
       };
     }
 
-    if (user.ip) {
+    if (user?.ip) {
       return {
         type: 'ip',
         value: user.ip,
@@ -197,11 +247,11 @@
       };
     }
 
-    if (user.nick === 'ㅇㅇ') {
-      return { error: '이 작성자는 화면에서 ID나 IP를 찾지 못해 다른 ㅇㅇ과 구별할 수 없습니다.' };
+    if (user?.nick === 'ㅇㅇ') {
+      return { error: 'PC 페이지에서도 이 사용자의 ID나 IP를 찾지 못했습니다.' };
     }
 
-    if (user.nick) {
+    if (user?.nick) {
       return {
         type: 'nick',
         value: user.nick,
@@ -232,7 +282,7 @@
 
     if (selectedType === 'nick') {
       if (value === 'ㅇㅇ') {
-        return { error: 'ㅇㅇ은 여러 유동 사용자가 함께 쓰므로 화면에서 선택하거나 유동 IP로 등록해 주세요.' };
+        return { error: 'ㅇㅇ은 여러 사용자가 함께 쓰므로 화면에서 사용자 선택을 사용해 주세요.' };
       }
       return { type: 'nick', value, label: value };
     }
@@ -248,16 +298,17 @@
     }
 
     if (value === 'ㅇㅇ') {
-      return { error: 'ㅇㅇ만 입력하면 사용자를 구별할 수 없습니다. 화면에서 선택 기능을 사용해 주세요.' };
+      return { error: 'ㅇㅇ만 입력하면 사용자를 구별할 수 없습니다. 화면에서 사용자 선택을 사용해 주세요.' };
     }
 
     return { type: 'any', value, label: value };
   }
 
-  function addEntry(entry, toastMessage = true) {
+  function addEntry(entry, showToast = true) {
     if (!entry || entry.error) return false;
+
     if (blockedUsers.some(item => sameBlockValue(item, entry))) {
-      if (toastMessage) toast('이미 차단 목록에 있습니다.');
+      if (showToast) toast('이미 차단 목록에 있습니다.');
       return false;
     }
 
@@ -265,7 +316,7 @@
     save();
     scan(true);
     renderPanelList();
-    if (toastMessage) toast(`${entry.label || entry.value} 차단 완료`);
+    if (showToast) toast(`${entry.label || entry.value} 차단 완료`);
     return true;
   }
 
@@ -310,6 +361,289 @@
     toast(`${blockLabel(removed)} 차단 해제`);
   }
 
+  function canonicalHref() {
+    return document.querySelector('link[rel="canonical"]')?.href
+      || document.querySelector('meta[property="og:url"]')?.content
+      || location.href;
+  }
+
+  function gallTypeFromSource(source) {
+    const value = String(source || '');
+    if (/\/mini\//i.test(value)) return 'mini';
+    if (/\/mgallery\//i.test(value)) return 'mgallery';
+    if (/\/person\//i.test(value)) return 'person';
+
+    const gallType = normalize(
+      document.querySelector('input[name="_GALLTYPE_"]')?.value
+      || document.querySelector('#_GALLTYPE_')?.value
+    ).toUpperCase();
+
+    if (gallType === 'MI') return 'mini';
+    if (gallType === 'M') return 'mgallery';
+    if (gallType === 'PR') return 'person';
+    return 'major';
+  }
+
+  function contextFromURL(href = location.href) {
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch (_) {
+      return null;
+    }
+
+    const canonical = canonicalHref();
+    const type = gallTypeFromSource(`${url.href} ${canonical}`);
+    const canonicalURL = new URL(canonical, location.href);
+
+    const path = url.pathname.split('/').filter(Boolean);
+    const canonicalPath = canonicalURL.pathname.split('/').filter(Boolean);
+
+    const boardIndex = path.lastIndexOf('board');
+    const canonicalBoardIndex = canonicalPath.lastIndexOf('board');
+
+    const gallery =
+      url.searchParams.get('id')
+      || canonicalURL.searchParams.get('id')
+      || normalize(document.querySelector('#gallery_id')?.value)
+      || normalize(document.querySelector('input[name="id"]')?.value)
+      || (boardIndex >= 0 ? path[boardIndex + 1] : '')
+      || (canonicalBoardIndex >= 0 ? canonicalPath[canonicalBoardIndex + 1] : '');
+
+    let postNo =
+      url.searchParams.get('no')
+      || canonicalURL.searchParams.get('no')
+      || '';
+
+    if (!postNo && boardIndex >= 0) {
+      const candidate = path[boardIndex + 2];
+      if (/^\d+$/.test(candidate || '')) postNo = candidate;
+    }
+
+    if (!postNo && canonicalBoardIndex >= 0) {
+      const candidate = canonicalPath[canonicalBoardIndex + 2];
+      if (/^\d+$/.test(candidate || '')) postNo = candidate;
+    }
+
+    const page = url.searchParams.get('page') || '1';
+
+    return gallery ? { gallery, postNo, page, type } : null;
+  }
+
+  function desktopPrefix(type) {
+    if (type === 'mini') return 'https://gall.dcinside.com/mini/';
+    if (type === 'mgallery') return 'https://gall.dcinside.com/mgallery/';
+    if (type === 'person') return 'https://gall.dcinside.com/person/';
+    return 'https://gall.dcinside.com/';
+  }
+
+  function gallTypeName(type) {
+    if (type === 'mini') return 'MI';
+    if (type === 'mgallery') return 'M';
+    if (type === 'person') return 'PR';
+    return 'G';
+  }
+
+  function postNoFromElement(container) {
+    if (!container) return '';
+
+    const attributes = [
+      container.getAttribute?.('data-no'),
+      container.dataset?.no,
+      container.getAttribute?.('data-post-no'),
+      container.dataset?.postNo
+    ];
+
+    for (const value of attributes) {
+      if (/^\d+$/.test(normalize(value))) return normalize(value);
+    }
+
+    const links = container.querySelectorAll?.('a[href]') || [];
+    for (const link of links) {
+      try {
+        const url = new URL(link.href, location.href);
+        const queryNo = url.searchParams.get('no');
+        if (/^\d+$/.test(queryNo || '')) return queryNo;
+
+        const parts = url.pathname.split('/').filter(Boolean);
+        const last = parts[parts.length - 1];
+        if (/^\d+$/.test(last || '')) return last;
+      } catch (_) {}
+    }
+
+    return '';
+  }
+
+  function commentNoFromElement(container) {
+    if (!container) return '';
+
+    const candidates = [
+      container.getAttribute?.('data-no'),
+      container.getAttribute?.('data-comment-no'),
+      container.dataset?.no,
+      container.dataset?.commentNo
+    ];
+
+    for (const candidate of candidates) {
+      if (/^\d+$/.test(normalize(candidate))) return normalize(candidate);
+    }
+
+    const idMatch = String(container.id || '').match(/(?:comment_cnt_|comment_)(\d+)/);
+    return idMatch ? idMatch[1] : '';
+  }
+
+  function isCommentContainer(container) {
+    return Boolean(container?.matches(
+      '.cmt_list > li, .reply_list > li, .all-comment-lst > li, .comment-lst > li, .reply-lst > li'
+    ));
+  }
+
+  function contextForContainer(container) {
+    const link = container?.querySelector?.('a[href*="/board/"]')?.href;
+    const context = contextFromURL(link || location.href);
+    if (!context) return null;
+
+    if (!context.postNo && !isCommentContainer(container)) {
+      context.postNo = postNoFromElement(container);
+    }
+
+    return context;
+  }
+
+  function parseDesktopUser(writer) {
+    if (!writer) return null;
+    const user = getUser(writer, writer);
+    return user && (user.uid || user.ip || user.nick) ? user : null;
+  }
+
+  async function fetchDesktopPost(context) {
+    if (!context?.gallery || !context?.postNo) {
+      throw new Error('게시글 번호를 찾지 못했습니다.');
+    }
+
+    const key = `${context.type}:${context.gallery}:${context.postNo}`;
+    if (remotePostCache.has(key)) return remotePostCache.get(key);
+
+    const promise = (async () => {
+      const url = `${desktopPrefix(context.type)}board/view/?id=${encodeURIComponent(context.gallery)}&no=${encodeURIComponent(context.postNo)}`;
+      const html = await requestText('GET', url);
+      const dom = new DOMParser().parseFromString(html, 'text/html');
+      const writer = dom.querySelector('.gallview_head > .gall_writer');
+
+      const commentId =
+        html.match(/\$\(document\)\.data\('comment_id',\s*'([^']+)'\)/)?.[1]
+        || context.gallery;
+
+      const commentNo =
+        html.match(/\$\(document\)\.data\('comment_no',\s*'([^']+)'\)/)?.[1]
+        || context.postNo;
+
+      return {
+        user: parseDesktopUser(writer),
+        eSNO: dom.querySelector('#e_s_n_o')?.value || '',
+        commentId,
+        commentNo
+      };
+    })();
+
+    remotePostCache.set(key, promise);
+
+    try {
+      return await promise;
+    } catch (error) {
+      remotePostCache.delete(key);
+      throw error;
+    }
+  }
+
+  async function fetchDesktopComments(context) {
+    if (!context?.gallery || !context?.postNo) {
+      throw new Error('댓글이 속한 게시글을 찾지 못했습니다.');
+    }
+
+    const key = `${context.type}:${context.gallery}:${context.postNo}`;
+    if (remoteCommentCache.has(key)) return remoteCommentCache.get(key);
+
+    const promise = (async () => {
+      const post = await fetchDesktopPost(context);
+      const params = new URLSearchParams();
+      params.set('ci_t', cookie('ci_c'));
+      params.set('_GALLTYPE_', gallTypeName(context.type));
+      params.set('id', context.gallery);
+      params.set('no', context.postNo);
+      params.set('cmt_id', post.commentId || context.gallery);
+      params.set('cmt_no', post.commentNo || context.postNo);
+      params.set('e_s_n_o', post.eSNO || '');
+      params.set('comment_page', '1');
+
+      const response = await requestText(
+        'POST',
+        'https://gall.dcinside.com/board/comment/',
+        params.toString(),
+        {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest'
+        }
+      );
+
+      const parsed = JSON.parse(response);
+      const map = new Map();
+
+      for (const comment of parsed.comments || []) {
+        const no = normalize(comment.no);
+        if (!no) continue;
+        map.set(no, {
+          uid: normalize(comment.user_id),
+          ip: normalize(comment.ip),
+          nick: normalize(comment.name || comment.nickname)
+        });
+      }
+
+      return map;
+    })();
+
+    remoteCommentCache.set(key, promise);
+
+    try {
+      return await promise;
+    } catch (error) {
+      remoteCommentCache.delete(key);
+      throw error;
+    }
+  }
+
+  async function fetchDesktopList(context) {
+    if (!context?.gallery) throw new Error('갤러리 ID를 찾지 못했습니다.');
+
+    const key = `${context.type}:${context.gallery}:${context.page || '1'}`;
+    if (remoteListCache.has(key)) return remoteListCache.get(key);
+
+    const promise = (async () => {
+      const url = `${desktopPrefix(context.type)}board/lists/?id=${encodeURIComponent(context.gallery)}&page=${encodeURIComponent(context.page || '1')}`;
+      const html = await requestText('GET', url);
+      const dom = new DOMParser().parseFromString(html, 'text/html');
+      const map = new Map();
+
+      dom.querySelectorAll('tr.ub-content[data-no], .gall_list tbody tr[data-no]').forEach(row => {
+        const no = normalize(row.getAttribute('data-no'));
+        const writer = row.querySelector('.gall_writer');
+        const user = parseDesktopUser(writer);
+        if (no && user) map.set(no, user);
+      });
+
+      return map;
+    })();
+
+    remoteListCache.set(key, promise);
+
+    try {
+      return await promise;
+    } catch (error) {
+      remoteListCache.delete(key);
+      throw error;
+    }
+  }
+
   function contentContainers() {
     const result = new Set();
     CONTAINER_SELECTORS.forEach(selector => {
@@ -333,7 +667,7 @@
       .filter(Boolean);
 
     const firstLine = lines[0] || '';
-    if (!/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)/.test(firstLine)) return null;
+    if (!firstLine) return null;
 
     let marker = container.querySelector(':scope > .dcub-text-author');
     if (!marker) {
@@ -358,21 +692,81 @@
     return commentTextAuthor(container);
   }
 
+  function updateContainerVisibility(container) {
+    const hidden =
+      container.dataset.dcubLocalBlocked === '1'
+      || container.dataset.dcubRemoteBlocked === '1';
+
+    container.classList.toggle(HIDDEN_CLASS, hidden);
+  }
+
   function processContainer(container, force = false) {
     if (!force && container.getAttribute(DONE_ATTRIBUTE) === '1') return;
     container.setAttribute(DONE_ATTRIBUTE, '1');
 
     const author = authorIn(container);
     const user = getUser(author, container);
-    if (!author || !user) return;
 
-    container.classList.toggle(HIDDEN_CLASS, isBlocked(user));
+    container.dataset.dcubLocalBlocked = user && isBlocked(user) ? '1' : '0';
+    updateContainerVisibility(container);
+  }
+
+  async function enrichMobileBlocks() {
+    if (!isMobile) return;
+
+    const containers = contentContainers();
+    containers.forEach(container => {
+      container.dataset.dcubRemoteBlocked = '0';
+      updateContainerVisibility(container);
+    });
+
+    if (!hasUidBlocks()) return;
+
+    const postContainers = containers.filter(container => !isCommentContainer(container));
+    const listContext = contextFromURL(location.href);
+
+    if (listContext && !listContext.postNo && postContainers.length) {
+      try {
+        const listMap = await fetchDesktopList(listContext);
+        for (const container of postContainers) {
+          const postNo = postNoFromElement(container);
+          const user = listMap.get(postNo);
+          container.dataset.dcubRemoteBlocked = user && isBlocked(user) ? '1' : '0';
+          updateContainerVisibility(container);
+        }
+      } catch (error) {
+        console.warn('[DCUB] 모바일 목록 ID 조회 실패:', error);
+      }
+    }
+
+    const commentContainers = containers.filter(isCommentContainer);
+    const detailContext = contextFromURL(location.href);
+
+    if (detailContext?.postNo && commentContainers.length) {
+      try {
+        const commentMap = await fetchDesktopComments(detailContext);
+        for (const container of commentContainers) {
+          const commentNo = commentNoFromElement(container);
+          const user = commentMap.get(commentNo);
+          container.dataset.dcubRemoteBlocked = user && isBlocked(user) ? '1' : '0';
+          updateContainerVisibility(container);
+        }
+      } catch (error) {
+        console.warn('[DCUB] 모바일 댓글 ID 조회 실패:', error);
+      }
+    }
+  }
+
+  function scheduleEnrichment() {
+    clearTimeout(enrichmentTimer);
+    enrichmentTimer = window.setTimeout(() => enrichMobileBlocks(), 180);
   }
 
   function scan(force = false) {
     contentContainers().forEach(container => processContainer(container, force));
     document.querySelectorAll('.block-disable').forEach(element => element.classList.add(HIDDEN_CLASS));
     mountFooterGear();
+    scheduleEnrichment();
   }
 
   function scheduleScan() {
@@ -402,7 +796,7 @@
       <div class="dcub-item">
         <div>
           <b>${escapeHTML(blockLabel(item))}</b>
-          <small>${item.type === 'ip' ? '유동 IP' : item.type === 'uid' ? '고닉 ID' : item.type === 'nick' ? '닉네임' : 'ID · 닉네임 자동 판별'}</small>
+          <small>${item.type === 'ip' ? '유동 IP' : item.type === 'uid' ? '고닉·반고닉 ID' : item.type === 'nick' ? '닉네임' : 'ID · 닉네임 자동 판별'}</small>
         </div>
         <button type="button" data-index="${index}">해제</button>
       </div>
@@ -416,8 +810,6 @@
   function createPanel() {
     if (document.getElementById('dcub-panel')) return;
 
-    document.getElementById('dcub-bottom-settings')?.remove();
-
     const panel = document.createElement('div');
     panel.id = 'dcub-panel';
     panel.innerHTML = `
@@ -430,7 +822,10 @@
         <div class="dcub-pick-section">
           <button type="button" id="dcub-pick-user">
             <span class="dcub-pick-icon">◎</span>
-            <span><b>화면에서 사용자 선택</b><small>글 목록이나 댓글의 작성자 이름을 직접 누릅니다.</small></span>
+            <span>
+              <b>화면에서 사용자 선택</b>
+              <small>모바일 반고닉도 PC 페이지에서 ID를 자동 확인합니다.</small>
+            </span>
           </button>
         </div>
 
@@ -445,7 +840,7 @@
             <input id="dcub-input" type="text" autocomplete="off" autocapitalize="none" placeholder="ㅇㅇ(211.245) 또는 @고닉ID">
             <button type="button" id="dcub-add">등록</button>
           </div>
-          <p id="dcub-help"><b>모바일에서는 위의 ‘화면에서 사용자 선택’이 가장 쉽습니다.</b> 작성자를 누르면 ID 또는 IP를 자동으로 찾습니다.</p>
+          <p id="dcub-help"><b>‘화면에서 사용자 선택’을 권장합니다.</b> 반고닉 ㅇㅇ은 PC용 게시글·댓글 데이터에서 실제 ID를 찾아 등록합니다.</p>
         </div>
 
         <div class="dcub-list"></div>
@@ -459,9 +854,9 @@
     const help = panel.querySelector('#dcub-help');
 
     const hints = {
-      auto: ['ㅇㅇ(211.245) 또는 @고닉ID', '<b>모바일에서는 ‘화면에서 사용자 선택’이 가장 쉽습니다.</b> 작성자를 누르면 ID 또는 IP를 자동으로 찾습니다.'],
+      auto: ['ㅇㅇ(211.245) 또는 @고닉ID', '<b>‘화면에서 사용자 선택’을 권장합니다.</b> 반고닉 ㅇㅇ도 실제 ID를 자동 조회합니다.'],
       ip: ['211.245 또는 ㅇㅇ(211.245)', '화면에 표시된 유동 IP를 입력합니다. 같은 표시 IP 사용자가 함께 차단될 수 있습니다.'],
-      uid: ['고닉의 갤로그 ID', '직접 알기 어려우면 ‘화면에서 사용자 선택’을 사용해 주세요.'],
+      uid: ['고닉·반고닉의 갤로그 ID', '직접 알기 어려우면 ‘화면에서 사용자 선택’을 사용해 주세요.'],
       nick: ['차단할 닉네임', '닉네임 차단은 같은 이름을 쓰는 다른 사용자도 함께 숨길 수 있습니다.']
     };
 
@@ -574,20 +969,22 @@
     return true;
   }
 
-  function selectionBar() {
+  function selectionBar(message = '차단할 작성자 이름을 눌러주세요.') {
     let bar = document.getElementById('dcub-selection-bar');
-    if (bar) return bar;
-
-    bar = document.createElement('div');
-    bar.id = 'dcub-selection-bar';
-    bar.innerHTML = '<span>차단할 작성자 이름을 눌러주세요.</span><button type="button">취소</button>';
-    bar.querySelector('button').addEventListener('click', () => cancelSelectionMode());
-    document.body.appendChild(bar);
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'dcub-selection-bar';
+      bar.innerHTML = '<span></span><button type="button">취소</button>';
+      bar.querySelector('button').addEventListener('click', () => cancelSelectionMode());
+      document.body.appendChild(bar);
+    }
+    bar.querySelector('span').textContent = message;
     return bar;
   }
 
   function beginSelectionMode() {
     selectionMode = true;
+    selectionBusy = false;
     document.documentElement.classList.add('dcub-selecting');
     selectionBar();
     clearTimeout(selectionTimeout);
@@ -597,6 +994,7 @@
   function cancelSelectionMode(showMessage = true) {
     if (!selectionMode && !document.getElementById('dcub-selection-bar')) return;
     selectionMode = false;
+    selectionBusy = false;
     clearTimeout(selectionTimeout);
     document.documentElement.classList.remove('dcub-selecting');
     document.getElementById('dcub-selection-bar')?.remove();
@@ -624,15 +1022,43 @@
     for (const selector of AUTHOR_SELECTORS) {
       const author = target.closest(selector);
       if (!author) continue;
-      const parentContainer = author.closest(CONTAINER_SELECTORS.join(',')) || author.closest('.gallview-tit-box, .gallview_head') || author;
+      const parentContainer =
+        author.closest(CONTAINER_SELECTORS.join(','))
+        || author.closest('.gallview-tit-box, .gallview_head')
+        || author;
       return { author, container: parentContainer };
     }
 
     return null;
   }
 
-  function handleSelectionTap(event) {
-    if (!selectionMode) return;
+  async function resolveSelectedUser(selected) {
+    const local = getUser(selected.author, selected.container) || {};
+    if (local.uid || local.ip) return local;
+
+    const context = contextForContainer(selected.container);
+    if (!context) return local;
+
+    if (isCommentContainer(selected.container)) {
+      const commentNo = commentNoFromElement(selected.container);
+      if (!commentNo) return local;
+
+      const comments = await fetchDesktopComments(context);
+      return comments.get(commentNo) || local;
+    }
+
+    if (!context.postNo) {
+      context.postNo = postNoFromElement(selected.container);
+    }
+
+    if (!context.postNo) return local;
+
+    const post = await fetchDesktopPost(context);
+    return post.user || local;
+  }
+
+  async function handleSelectionTap(event) {
+    if (!selectionMode || selectionBusy) return;
     if (event.target.closest('#dcub-selection-bar, #dcub-panel, #dcub-footer-settings')) return;
 
     const selected = selectionTarget(event.target);
@@ -645,23 +1071,39 @@
     event.stopPropagation();
     event.stopImmediatePropagation();
 
-    const user = getUser(selected.author, selected.container);
-    const entry = selectedUserEntry(user || {});
+    selectionBusy = true;
+    selectionBar('PC 데이터에서 작성자 ID 확인 중…');
 
-    if (entry.error) {
-      alert(entry.error);
+    try {
+      const user = await resolveSelectedUser(selected);
+      const entry = selectedUserEntry(user);
+
+      if (entry.error) {
+        alert(`${entry.error}\n\n유니콘 PRO에서 이 스크립트의 gall.dcinside.com 접근 권한도 확인해 주세요.`);
+        cancelSelectionMode(false);
+        return;
+      }
+
+      const basis =
+        entry.type === 'uid' ? '고닉·반고닉 ID'
+          : entry.type === 'ip' ? '유동 IP'
+            : '닉네임';
+
+      if (!confirm(`${entry.label} 사용자를 차단하시겠습니까?\n\n차단 기준: ${basis}`)) {
+        cancelSelectionMode(false);
+        return;
+      }
+
+      addEntry(entry);
       cancelSelectionMode(false);
-      return;
-    }
-
-    const basis = entry.type === 'uid' ? '고닉 ID' : entry.type === 'ip' ? '유동 IP' : '닉네임';
-    if (!confirm(`${entry.label} 사용자를 차단하시겠습니까?\n\n차단 기준: ${basis}`)) {
+    } catch (error) {
+      console.warn('[DCUB] 작성자 ID 조회 실패:', error);
+      alert(
+        `작성자 ID를 조회하지 못했습니다.\n\n${error.message || error}\n\n` +
+        '유니콘 PRO에서 이 스크립트의 gall.dcinside.com 사이트 접근 권한을 허용했는지 확인해 주세요.'
+      );
       cancelSelectionMode(false);
-      return;
     }
-
-    addEntry(entry);
-    cancelSelectionMode(false);
   }
 
   function injectStyle() {
@@ -936,9 +1378,9 @@
     });
 
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    window.setInterval(() => scan(), isMobile ? 1500 : 3000);
+    window.setInterval(() => scan(), isMobile ? 2500 : 4000);
 
-    console.info('[DCUB] v1.4.0 실행됨');
+    console.info('[DCUB] v1.5.0 실행됨');
   }
 
   init();
