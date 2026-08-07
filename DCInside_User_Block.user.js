@@ -1,1387 +1,224 @@
 // ==UserScript==
 // @name         DCInside User Block
 // @namespace    https://github.com/jupia389-rgb/suking
-// @version      1.5.0
-// @description  디시인사이드 모바일/PC 사용자 차단 (모바일 반고닉 ID 자동 조회)
+// @version      1.6.0
+// @description  외부 요청 권한 없이 디시인사이드 식별 코드·IP·닉네임 차단
 // @match        https://gall.dcinside.com/*
 // @match        https://m.dcinside.com/*
-// @run-at       document-end
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_xmlhttpRequest
-// @connect      gall.dcinside.com
-// @downloadURL  https://raw.githubusercontent.com/jupia389-rgb/suking/main/DCInside_User_Block.user.js
-// @updateURL    https://raw.githubusercontent.com/jupia389-rgb/suking/main/DCInside_User_Block.user.js
+// @run-at       document-start
+// @grant        none
 // ==/UserScript==
 
-(() => {
-  'use strict';
+(()=>{'use strict';
 
-  const STORE_KEY = 'dcub_users_v1';
-  const HIDDEN_CLASS = 'dcub-hidden';
-  const DONE_ATTRIBUTE = 'data-dcub-done';
-  const isMobile = location.hostname === 'm.dcinside.com';
-
-  const CONTAINER_SELECTORS = [
-    'tr.ub-content',
-    '.gall_list tbody tr[data-no]',
-    'li.ub-content',
-    '.cmt_list > li[id^="comment_"]',
-    '.reply_list > li[id^="comment_"]',
-    '.gall-detail-lst > li',
-    '#view_next > li',
-    '.all-comment-lst > li[id^="comment_cnt_"]',
-    '.comment-lst > li[id^="comment_"]',
-    '.reply-lst > li[id^="comment_"]'
-  ];
-
-  const AUTHOR_SELECTORS = [
-    '.gall_writer[data-nick]',
-    '.gall_writer[data-uid]',
-    '.gall_writer[data-ip]',
-    '.cmt_nickbox .gall_writer',
-    '.cmt_nickbox .nickname',
-    '.cmt_nickbox .nick_name',
-    '[data-nick]',
-    '[data-uid]',
-    '[data-ip]',
-    '.gall_writer',
-    '.nickname',
-    '.nick_name',
-    '.comment-nick',
-    '.user-nick',
-    '.user_info'
-  ];
-
-  const remotePostCache = new Map();
-  const remoteListCache = new Map();
-  const remoteCommentCache = new Map();
-
-  let blockedUsers = load(STORE_KEY, []);
-  let scanTimer = 0;
-  let selectionMode = false;
-  let selectionBusy = false;
-  let selectionTimeout = 0;
-  let enrichmentTimer = 0;
-
-  function load(key, fallback) {
-    try {
-      const raw = typeof GM_getValue === 'function'
-        ? GM_getValue(key, '')
-        : localStorage.getItem(key);
-      if (!raw) return fallback;
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return Array.isArray(parsed) ? parsed : fallback;
-    } catch (error) {
-      console.warn('[DCUB] 저장 데이터 읽기 실패:', error);
-      return fallback;
-    }
+const V='1.6.0',BH='dcub-lookup',RC='dcub_result_',MC='dcub_managed_blocks',NK='block_all';
+const POST=['tr.ub-content','.gall_list tbody tr[data-no]','.gall-detail-lst>li','#view_next>li','li[data-no]'];
+const CMT=['.cmt_list>li[id^="comment_"]','.reply_list>li[id^="comment_"]','.all-comment-lst>li[id^="comment_cnt_"]','.comment-lst>li[id^="comment_"]','.reply-lst>li[id^="comment_"]'];
+const ALL=[...POST,...CMT],mobile=location.hostname==='m.dcinside.com';
+let selecting=false,busy=false,timer=0;
+const norm=v=>String(v||'').replace(/\s+/g,' ').trim(),low=v=>norm(v).toLowerCase();
+const esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const json=(s,f)=>{try{return s?JSON.parse(s):f}catch(_){return f}};
+function ck(n){const m=document.cookie.match(new RegExp(`(?:^|;\\s*)${n.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}=([^;]*)`));return m?decodeURIComponent(m[1]):''}
+function setC(n,v,sec=31536000){document.cookie=`${n}=${encodeURIComponent(v)}; Domain=.dcinside.com; Path=/; Max-Age=${sec}; SameSite=Lax`}
+function delC(n){document.cookie=`${n}=; Domain=.dcinside.com; Path=/; Max-Age=0; SameSite=Lax`}
+function cfg(){const o=json(localStorage.getItem(NK),{});return{on:1,word:typeof o.word==='string'?o.word:'',id:typeof o.id==='string'?o.id:'',nick:typeof o.nick==='string'?o.nick:'',ip:typeof o.ip==='string'?o.ip:''}}
+function saveCfg(o){localStorage.setItem(NK,JSON.stringify({...o,on:1}))}
+const arr=v=>String(v||'').split('||').map(x=>x.trim()).filter(Boolean);
+function managed(){const a=json(ck(MC),[]);return Array.isArray(a)?a.filter(x=>x&&['uid','ip','nick'].includes(x.type)&&norm(x.value)):[]}
+function saveManaged(a){setC(MC,JSON.stringify(a))}
+const field=t=>t==='uid'?'id':t;
+function sync(){
+  const c=cfg(),m=managed();
+  m.forEach(x=>{const f=field(x.type),a=arr(c[f]);if(!a.some(v=>low(v)===low(x.value))){a.push(x.value);c[f]=a.join('||')}});
+  saveCfg(c);
+}
+function add(e){
+  if(!e?.type||!e.value)return false;
+  const c=cfg(),f=field(e.type),a=arr(c[f]);
+  if(a.some(v=>low(v)===low(e.value))){toast('이미 차단 목록에 있습니다.');return false}
+  if(a.length>=10){alert('디시인사이드 차단은 종류별 최대 10개까지 등록할 수 있습니다.');return false}
+  a.push(e.value);c[f]=a.join('||');saveCfg(c);
+  const m=managed();
+  if(!m.some(x=>x.type===e.type&&low(x.value)===low(e.value)))m.unshift({...e,createdAt:Date.now()});
+  saveManaged(m);render();toast(`${e.label||e.value} 차단 완료`);return true;
+}
+function remove(t,v){
+  const c=cfg(),f=field(t);c[f]=arr(c[f]).filter(x=>low(x)!==low(v)).join('||');saveCfg(c);
+  saveManaged(managed().filter(x=>!(x.type===t&&low(x.value)===low(v))));
+  render();toast(`${v} 차단 해제`);
+}
+function ipOf(s){const m=String(s||'').match(/(?:^|[([])((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))(?:$|[)\]])/);return m?m[1]:''}
+const cleanNick=s=>norm(s).replace(/^글쓴\s+/,'').replace(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)\s*$/,'').trim();
+function writer(root){
+  if(!root)return null;
+  const ss=['.gall_writer[data-uid]','.gall_writer[data-ip]','.gall_writer[data-nick]','.gall_writer','.ginfo2>li:first-child','ul.ginfo>li:nth-child(2)','.cmt_nickbox [data-uid]','.cmt_nickbox [data-ip]','.cmt_nickbox [data-nick]','.cmt_nickbox .nickname','.cmt_nickbox .nick_name','.nickname','.nick_name','[data-uid]','[data-ip]','[data-nick]'];
+  for(const s of ss){const e=root.matches?.(s)?root:root.querySelector?.(s);if(e&&norm(e.textContent))return e}
+  return null;
+}
+function user(w){
+  if(!w)return null;
+  const uid=norm(w.dataset?.uid||w.dataset?.userId||w.getAttribute?.('data-uid')||w.getAttribute?.('data-user-id'));
+  const raw=norm(w.textContent),ip=norm(w.dataset?.ip||w.getAttribute?.('data-ip')||ipOf(raw));
+  const nick=cleanNick(w.dataset?.nick||w.getAttribute?.('data-nick')||raw);
+  return uid||ip||nick?{uid,ip,nick:nick||uid||ip}:null;
+}
+function entry(u){
+  if(u?.uid)return{type:'uid',value:u.uid,label:u.nick&&u.nick!==u.uid?`${u.nick} (@${u.uid})`:`@${u.uid}`};
+  if(u?.ip)return{type:'ip',value:u.ip,label:`${u.nick||'ㅇㅇ'}(${u.ip})`};
+  if(u?.nick&&u.nick!=='ㅇㅇ')return{type:'nick',value:u.nick,label:u.nick};
+  return null;
+}
+function manual(raw,t){
+  let v=norm(raw);if(!v)return null;
+  const ip=ipOf(v)||(/^(?:\d{1,3}\.){1,3}(?:\d{1,3}|\*)$/.test(v)?v:'');
+  if(t==='ip'||(t==='auto'&&ip))return ip?{type:'ip',value:ip,label:v}:{error:'IP는 211.245 또는 ㅇㅇ(211.245)처럼 입력해 주세요.'};
+  if(t==='uid'||(t==='auto'&&v.startsWith('@'))){v=v.replace(/^@/,'').trim();return v?{type:'uid',value:v,label:`@${v}`}:null}
+  if(v==='ㅇㅇ')return{error:'ㅇㅇ만으로는 구별할 수 없습니다. 화면에서 글을 선택해 주세요.'};
+  return{type:'nick',value:v,label:v};
+}
+function postNo(box){
+  for(const v of [box?.getAttribute?.('data-no'),box?.dataset?.no,box?.getAttribute?.('data-post-no'),box?.dataset?.postNo])if(/^\d+$/.test(norm(v)))return norm(v);
+  for(const a of box?.querySelectorAll?.('a[href]')||[]){try{const u=new URL(a.href,location.href),q=u.searchParams.get('no'),last=u.pathname.split('/').filter(Boolean).pop();if(/^\d+$/.test(q||''))return q;if(/^\d+$/.test(last||''))return last}catch(_){}}
+  return'';
+}
+function commentNo(box){
+  for(const v of [box?.getAttribute?.('data-no'),box?.getAttribute?.('data-comment-no'),box?.dataset?.no,box?.dataset?.commentNo])if(/^\d+$/.test(norm(v)))return norm(v);
+  return String(box?.id||'').match(/(?:comment_cnt_|comment_)(\d+)/)?.[1]||'';
+}
+function canonical(){return document.querySelector('link[rel="canonical"]')?.href||document.querySelector('meta[property="og:url"]')?.content||location.href}
+function context(href=location.href){
+  try{
+    const u=new URL(href,location.href),cu=new URL(canonical(),location.href),src=`${u.href} ${cu.href}`;
+    const type=/\/mini\//i.test(src)?'mini':/\/mgallery\//i.test(src)?'mgallery':/\/person\//i.test(src)?'person':'major';
+    const p=u.pathname.split('/').filter(Boolean),cp=cu.pathname.split('/').filter(Boolean),bi=p.lastIndexOf('board'),cbi=cp.lastIndexOf('board');
+    const gallery=u.searchParams.get('id')||cu.searchParams.get('id')||norm(document.querySelector('#gallery_id')?.value)||norm(document.querySelector('input[name="id"]')?.value)||(bi>=0?p[bi+1]:'')||(cbi>=0?cp[cbi+1]:'');
+    let no=u.searchParams.get('no')||cu.searchParams.get('no')||'';
+    if(!no&&bi>=0&&/^\d+$/.test(p[bi+2]||''))no=p[bi+2];
+    if(!no&&cbi>=0&&/^\d+$/.test(cp[cbi+2]||''))no=cp[cbi+2];
+    return gallery?{gallery,postNo:no,type}:null;
+  }catch(_){return null}
+}
+const prefix=t=>t==='mini'?'https://gall.dcinside.com/mini/':t==='mgallery'?'https://gall.dcinside.com/mgallery/':t==='person'?'https://gall.dcinside.com/person/':'https://gall.dcinside.com/';
+const gt=t=>t==='mini'?'MI':t==='mgallery'?'M':t==='person'?'PR':'G';
+function bridgeData(){const p=new URLSearchParams(location.hash.slice(1));return p.has(BH)?{token:p.get(BH)||'',mode:p.get('mode')||'post',gallery:p.get('gallery')||'',postNo:p.get('postNo')||'',commentNo:p.get('commentNo')||'',gallType:p.get('gallType')||'G'}:null}
+async function bridgeComment(p){
+  const html=document.documentElement.innerHTML;
+  const cid=html.match(/\$\(document\)\.data\('comment_id',\s*'([^']+)'\)/)?.[1]||p.gallery;
+  const cno=html.match(/\$\(document\)\.data\('comment_no',\s*'([^']+)'\)/)?.[1]||p.postNo;
+  for(let page=1;page<=10;page++){
+    const q=new URLSearchParams({ci_t:(document.cookie.match(/(?:^|;\s*)ci_c=([^;]*)/)||[])[1]||'',_GALLTYPE_:p.gallType,id:p.gallery,no:p.postNo,cmt_id:cid,cmt_no:cno,e_s_n_o:document.querySelector('#e_s_n_o')?.value||'',comment_page:String(page)});
+    const r=await fetch('https://gall.dcinside.com/board/comment/',{method:'POST',credentials:'include',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','X-Requested-With':'XMLHttpRequest'},body:q.toString()});
+    if(!r.ok)throw new Error(`댓글 조회 실패: HTTP ${r.status}`);
+    const j=await r.json(),list=j.comments||[],c=list.find(x=>norm(x.no)===norm(p.commentNo));
+    if(c)return{uid:norm(c.user_id),ip:norm(c.ip),nick:norm(c.name||c.nickname)};
+    if(!list.length)break;
   }
-
-  function save() {
-    const raw = JSON.stringify(blockedUsers);
-    try {
-      if (typeof GM_setValue === 'function') GM_setValue(STORE_KEY, raw);
-      else localStorage.setItem(STORE_KEY, raw);
-    } catch (error) {
-      console.warn('[DCUB] 저장 실패:', error);
-    }
-  }
-
-  const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
-  const compareKey = value => normalize(value).toLocaleLowerCase();
-
-  const escapeHTML = value => String(value).replace(/[&<>"']/g, char => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[char]);
-
-  function cookie(name) {
-    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
-    return match ? decodeURIComponent(match[1]) : '';
-  }
-
-  function requestText(method, url, body = null, headers = {}) {
-    if (typeof GM_xmlhttpRequest === 'function') {
-      return new Promise((resolve, reject) => {
-        GM_xmlhttpRequest({
-          method,
-          url,
-          data: body,
-          headers,
-          timeout: 15000,
-          anonymous: false,
-          onload: response => {
-            if (response.status >= 200 && response.status < 400) {
-              resolve(response.responseText);
-            } else {
-              reject(new Error(`HTTP ${response.status}`));
-            }
-          },
-          onerror: () => reject(new Error('네트워크 요청 실패')),
-          ontimeout: () => reject(new Error('요청 시간 초과'))
-        });
-      });
-    }
-
-    return fetch(url, {
-      method,
-      body,
-      headers,
-      credentials: 'include'
-    }).then(response => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      return response.text();
-    });
-  }
-
-  function firstAttribute(root, names) {
-    if (!root) return '';
-
-    const nodes = [root];
-    if (root.querySelectorAll) {
-      const selector = names.map(name => `[${name}]`).join(',');
-      if (selector) root.querySelectorAll(selector).forEach(node => nodes.push(node));
-    }
-
-    for (const node of nodes) {
-      for (const name of names) {
-        const value = normalize(node.getAttribute?.(name));
-        if (value) return value;
-      }
-    }
-    return '';
-  }
-
-  function extractGallogId(root) {
-    if (!root) return '';
-
-    const nodes = [root];
-    root.querySelectorAll?.('a[href], [onclick]').forEach(node => nodes.push(node));
-
-    for (const node of nodes) {
-      const source = `${node.getAttribute?.('href') || ''} ${node.getAttribute?.('onclick') || ''}`;
-      const match = source.match(/gallog\.dcinside\.com\/([^/?#'" )]+)/i);
-      if (!match) continue;
-      try {
-        return decodeURIComponent(match[1]);
-      } catch (_) {
-        return match[1];
-      }
-    }
-    return '';
-  }
-
-  function extractIP(raw, root) {
-    const stored = firstAttribute(root, ['data-ip', 'data-user-ip', 'ip']);
-    if (stored) return stored.replace(/[()[\]\s]/g, '');
-
-    const match = String(raw || '').match(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)/);
-    return match ? match[1] : '';
-  }
-
-  function cleanNickname(raw) {
-    return normalize(raw)
-      .replace(/^글쓴\s+/, '')
-      .replace(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)\s*$/, '')
-      .replace(/\s*(차단|해제)\s*$/, '')
-      .trim();
-  }
-
-  function getUser(author, container) {
-    if (!author) return null;
-
-    const context = container || author;
-    const raw = normalize(author.textContent);
-    const nickFromData = firstAttribute(author, ['data-nick', 'data-name', 'data-user-name']);
-    const uid = firstAttribute(context, ['data-uid', 'data-user-id', 'data-userid']) || extractGallogId(context);
-    const ip = extractIP(raw, context);
-    const nick = cleanNickname(nickFromData || raw);
-
-    if (!uid && !ip && !nick) return null;
-    return { uid, ip, nick: nick || uid || ip };
-  }
-
-  function blockLabel(item) {
-    return normalize(item.label || item.nick || item.value);
-  }
-
-  function sameBlockValue(a, b) {
-    return a.type === b.type && compareKey(a.value) === compareKey(b.value);
-  }
-
-  function matchesBlock(item, user) {
-    if (!item || !user) return false;
-    const savedValue = compareKey(item.value || item.label || item.nick);
-    if (!savedValue) return false;
-
-    if (item.type === 'uid') return Boolean(user.uid) && savedValue === compareKey(user.uid);
-    if (item.type === 'ip') return Boolean(user.ip) && savedValue === compareKey(user.ip);
-    if (item.type === 'nick') return Boolean(user.nick) && savedValue === compareKey(user.nick);
-
-    return [user.uid, user.ip, user.nick].some(value => value && savedValue === compareKey(value));
-  }
-
-  const isBlocked = user => blockedUsers.some(item => matchesBlock(item, user));
-  const hasUidBlocks = () => blockedUsers.some(item => item.type === 'uid');
-
-  function selectedUserEntry(user) {
-    if (user?.uid) {
-      return {
-        type: 'uid',
-        value: user.uid,
-        label: user.nick && user.nick !== user.uid
-          ? `${user.nick} (@${user.uid})`
-          : `@${user.uid}`
-      };
-    }
-
-    if (user?.ip) {
-      return {
-        type: 'ip',
-        value: user.ip,
-        label: `${user.nick || 'ㅇㅇ'}(${user.ip})`
-      };
-    }
-
-    if (user?.nick === 'ㅇㅇ') {
-      return { error: 'PC 페이지에서도 이 사용자의 ID나 IP를 찾지 못했습니다.' };
-    }
-
-    if (user?.nick) {
-      return {
-        type: 'nick',
-        value: user.nick,
-        label: user.nick
-      };
-    }
-
-    return { error: '작성자 식별 정보를 찾지 못했습니다.' };
-  }
-
-  function parseEntry(raw, selectedType) {
-    let value = normalize(raw);
-    if (!value) return null;
-
-    const wrappedIP = value.match(/\(((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))\)/);
-    const plainIP = value.match(/^((?:\d{1,3}\.){1,3}(?:\d{1,3}|\*))$/);
-
-    if (selectedType === 'ip') {
-      const match = wrappedIP || plainIP;
-      if (!match) return { error: '유동 IP는 ㅇㅇ(211.245) 또는 211.245처럼 입력해 주세요.' };
-      return { type: 'ip', value: match[1], label: value };
-    }
-
-    if (selectedType === 'uid') {
-      value = value.replace(/^@/, '').trim();
-      return value ? { type: 'uid', value, label: `@${value}` } : null;
-    }
-
-    if (selectedType === 'nick') {
-      if (value === 'ㅇㅇ') {
-        return { error: 'ㅇㅇ은 여러 사용자가 함께 쓰므로 화면에서 사용자 선택을 사용해 주세요.' };
-      }
-      return { type: 'nick', value, label: value };
-    }
-
-    if (wrappedIP || plainIP) {
-      const ip = (wrappedIP || plainIP)[1];
-      return { type: 'ip', value: ip, label: value };
-    }
-
-    if (value.startsWith('@')) {
-      value = value.slice(1).trim();
-      return value ? { type: 'uid', value, label: `@${value}` } : null;
-    }
-
-    if (value === 'ㅇㅇ') {
-      return { error: 'ㅇㅇ만 입력하면 사용자를 구별할 수 없습니다. 화면에서 사용자 선택을 사용해 주세요.' };
-    }
-
-    return { type: 'any', value, label: value };
-  }
-
-  function addEntry(entry, showToast = true) {
-    if (!entry || entry.error) return false;
-
-    if (blockedUsers.some(item => sameBlockValue(item, entry))) {
-      if (showToast) toast('이미 차단 목록에 있습니다.');
-      return false;
-    }
-
-    blockedUsers.unshift({ ...entry, createdAt: Date.now() });
-    save();
-    scan(true);
-    renderPanelList();
-    if (showToast) toast(`${entry.label || entry.value} 차단 완료`);
-    return true;
-  }
-
-  function addEntries(rawText, selectedType) {
-    const values = String(rawText || '')
-      .split(/[\n,]+/)
-      .map(value => value.trim())
-      .filter(Boolean);
-
-    let added = 0;
-    const errors = [];
-
-    for (const value of values) {
-      const entry = parseEntry(value, selectedType);
-      if (!entry) continue;
-      if (entry.error) {
-        errors.push(entry.error);
-        continue;
-      }
-      if (blockedUsers.some(item => sameBlockValue(item, entry))) continue;
-      blockedUsers.unshift({ ...entry, createdAt: Date.now() });
-      added += 1;
-    }
-
-    if (added) {
-      save();
-      scan(true);
-      renderPanelList();
-      toast(`${added}개 항목을 차단 목록에 추가했습니다.`);
-    }
-
-    if (errors.length) alert([...new Set(errors)].join('\n'));
-    return added > 0;
-  }
-
-  function removeBlockedUser(index) {
-    if (!Number.isInteger(index) || index < 0 || index >= blockedUsers.length) return;
-    const removed = blockedUsers.splice(index, 1)[0];
-    save();
-    scan(true);
-    renderPanelList();
-    toast(`${blockLabel(removed)} 차단 해제`);
-  }
-
-  function canonicalHref() {
-    return document.querySelector('link[rel="canonical"]')?.href
-      || document.querySelector('meta[property="og:url"]')?.content
-      || location.href;
-  }
-
-  function gallTypeFromSource(source) {
-    const value = String(source || '');
-    if (/\/mini\//i.test(value)) return 'mini';
-    if (/\/mgallery\//i.test(value)) return 'mgallery';
-    if (/\/person\//i.test(value)) return 'person';
-
-    const gallType = normalize(
-      document.querySelector('input[name="_GALLTYPE_"]')?.value
-      || document.querySelector('#_GALLTYPE_')?.value
-    ).toUpperCase();
-
-    if (gallType === 'MI') return 'mini';
-    if (gallType === 'M') return 'mgallery';
-    if (gallType === 'PR') return 'person';
-    return 'major';
-  }
-
-  function contextFromURL(href = location.href) {
-    let url;
-    try {
-      url = new URL(href, location.href);
-    } catch (_) {
-      return null;
-    }
-
-    const canonical = canonicalHref();
-    const type = gallTypeFromSource(`${url.href} ${canonical}`);
-    const canonicalURL = new URL(canonical, location.href);
-
-    const path = url.pathname.split('/').filter(Boolean);
-    const canonicalPath = canonicalURL.pathname.split('/').filter(Boolean);
-
-    const boardIndex = path.lastIndexOf('board');
-    const canonicalBoardIndex = canonicalPath.lastIndexOf('board');
-
-    const gallery =
-      url.searchParams.get('id')
-      || canonicalURL.searchParams.get('id')
-      || normalize(document.querySelector('#gallery_id')?.value)
-      || normalize(document.querySelector('input[name="id"]')?.value)
-      || (boardIndex >= 0 ? path[boardIndex + 1] : '')
-      || (canonicalBoardIndex >= 0 ? canonicalPath[canonicalBoardIndex + 1] : '');
-
-    let postNo =
-      url.searchParams.get('no')
-      || canonicalURL.searchParams.get('no')
-      || '';
-
-    if (!postNo && boardIndex >= 0) {
-      const candidate = path[boardIndex + 2];
-      if (/^\d+$/.test(candidate || '')) postNo = candidate;
-    }
-
-    if (!postNo && canonicalBoardIndex >= 0) {
-      const candidate = canonicalPath[canonicalBoardIndex + 2];
-      if (/^\d+$/.test(candidate || '')) postNo = candidate;
-    }
-
-    const page = url.searchParams.get('page') || '1';
-
-    return gallery ? { gallery, postNo, page, type } : null;
-  }
-
-  function desktopPrefix(type) {
-    if (type === 'mini') return 'https://gall.dcinside.com/mini/';
-    if (type === 'mgallery') return 'https://gall.dcinside.com/mgallery/';
-    if (type === 'person') return 'https://gall.dcinside.com/person/';
-    return 'https://gall.dcinside.com/';
-  }
-
-  function gallTypeName(type) {
-    if (type === 'mini') return 'MI';
-    if (type === 'mgallery') return 'M';
-    if (type === 'person') return 'PR';
-    return 'G';
-  }
-
-  function postNoFromElement(container) {
-    if (!container) return '';
-
-    const attributes = [
-      container.getAttribute?.('data-no'),
-      container.dataset?.no,
-      container.getAttribute?.('data-post-no'),
-      container.dataset?.postNo
-    ];
-
-    for (const value of attributes) {
-      if (/^\d+$/.test(normalize(value))) return normalize(value);
-    }
-
-    const links = container.querySelectorAll?.('a[href]') || [];
-    for (const link of links) {
-      try {
-        const url = new URL(link.href, location.href);
-        const queryNo = url.searchParams.get('no');
-        if (/^\d+$/.test(queryNo || '')) return queryNo;
-
-        const parts = url.pathname.split('/').filter(Boolean);
-        const last = parts[parts.length - 1];
-        if (/^\d+$/.test(last || '')) return last;
-      } catch (_) {}
-    }
-
-    return '';
-  }
-
-  function commentNoFromElement(container) {
-    if (!container) return '';
-
-    const candidates = [
-      container.getAttribute?.('data-no'),
-      container.getAttribute?.('data-comment-no'),
-      container.dataset?.no,
-      container.dataset?.commentNo
-    ];
-
-    for (const candidate of candidates) {
-      if (/^\d+$/.test(normalize(candidate))) return normalize(candidate);
-    }
-
-    const idMatch = String(container.id || '').match(/(?:comment_cnt_|comment_)(\d+)/);
-    return idMatch ? idMatch[1] : '';
-  }
-
-  function isCommentContainer(container) {
-    return Boolean(container?.matches(
-      '.cmt_list > li, .reply_list > li, .all-comment-lst > li, .comment-lst > li, .reply-lst > li'
-    ));
-  }
-
-  function contextForContainer(container) {
-    const link = container?.querySelector?.('a[href*="/board/"]')?.href;
-    const context = contextFromURL(link || location.href);
-    if (!context) return null;
-
-    if (!context.postNo && !isCommentContainer(container)) {
-      context.postNo = postNoFromElement(container);
-    }
-
-    return context;
-  }
-
-  function parseDesktopUser(writer) {
-    if (!writer) return null;
-    const user = getUser(writer, writer);
-    return user && (user.uid || user.ip || user.nick) ? user : null;
-  }
-
-  async function fetchDesktopPost(context) {
-    if (!context?.gallery || !context?.postNo) {
-      throw new Error('게시글 번호를 찾지 못했습니다.');
-    }
-
-    const key = `${context.type}:${context.gallery}:${context.postNo}`;
-    if (remotePostCache.has(key)) return remotePostCache.get(key);
-
-    const promise = (async () => {
-      const url = `${desktopPrefix(context.type)}board/view/?id=${encodeURIComponent(context.gallery)}&no=${encodeURIComponent(context.postNo)}`;
-      const html = await requestText('GET', url);
-      const dom = new DOMParser().parseFromString(html, 'text/html');
-      const writer = dom.querySelector('.gallview_head > .gall_writer');
-
-      const commentId =
-        html.match(/\$\(document\)\.data\('comment_id',\s*'([^']+)'\)/)?.[1]
-        || context.gallery;
-
-      const commentNo =
-        html.match(/\$\(document\)\.data\('comment_no',\s*'([^']+)'\)/)?.[1]
-        || context.postNo;
-
-      return {
-        user: parseDesktopUser(writer),
-        eSNO: dom.querySelector('#e_s_n_o')?.value || '',
-        commentId,
-        commentNo
-      };
-    })();
-
-    remotePostCache.set(key, promise);
-
-    try {
-      return await promise;
-    } catch (error) {
-      remotePostCache.delete(key);
-      throw error;
-    }
-  }
-
-  async function fetchDesktopComments(context) {
-    if (!context?.gallery || !context?.postNo) {
-      throw new Error('댓글이 속한 게시글을 찾지 못했습니다.');
-    }
-
-    const key = `${context.type}:${context.gallery}:${context.postNo}`;
-    if (remoteCommentCache.has(key)) return remoteCommentCache.get(key);
-
-    const promise = (async () => {
-      const post = await fetchDesktopPost(context);
-      const params = new URLSearchParams();
-      params.set('ci_t', cookie('ci_c'));
-      params.set('_GALLTYPE_', gallTypeName(context.type));
-      params.set('id', context.gallery);
-      params.set('no', context.postNo);
-      params.set('cmt_id', post.commentId || context.gallery);
-      params.set('cmt_no', post.commentNo || context.postNo);
-      params.set('e_s_n_o', post.eSNO || '');
-      params.set('comment_page', '1');
-
-      const response = await requestText(
-        'POST',
-        'https://gall.dcinside.com/board/comment/',
-        params.toString(),
-        {
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest'
-        }
-      );
-
-      const parsed = JSON.parse(response);
-      const map = new Map();
-
-      for (const comment of parsed.comments || []) {
-        const no = normalize(comment.no);
-        if (!no) continue;
-        map.set(no, {
-          uid: normalize(comment.user_id),
-          ip: normalize(comment.ip),
-          nick: normalize(comment.name || comment.nickname)
-        });
-      }
-
-      return map;
-    })();
-
-    remoteCommentCache.set(key, promise);
-
-    try {
-      return await promise;
-    } catch (error) {
-      remoteCommentCache.delete(key);
-      throw error;
-    }
-  }
-
-  async function fetchDesktopList(context) {
-    if (!context?.gallery) throw new Error('갤러리 ID를 찾지 못했습니다.');
-
-    const key = `${context.type}:${context.gallery}:${context.page || '1'}`;
-    if (remoteListCache.has(key)) return remoteListCache.get(key);
-
-    const promise = (async () => {
-      const url = `${desktopPrefix(context.type)}board/lists/?id=${encodeURIComponent(context.gallery)}&page=${encodeURIComponent(context.page || '1')}`;
-      const html = await requestText('GET', url);
-      const dom = new DOMParser().parseFromString(html, 'text/html');
-      const map = new Map();
-
-      dom.querySelectorAll('tr.ub-content[data-no], .gall_list tbody tr[data-no]').forEach(row => {
-        const no = normalize(row.getAttribute('data-no'));
-        const writer = row.querySelector('.gall_writer');
-        const user = parseDesktopUser(writer);
-        if (no && user) map.set(no, user);
-      });
-
-      return map;
-    })();
-
-    remoteListCache.set(key, promise);
-
-    try {
-      return await promise;
-    } catch (error) {
-      remoteListCache.delete(key);
-      throw error;
-    }
-  }
-
-  function contentContainers() {
-    const result = new Set();
-    CONTAINER_SELECTORS.forEach(selector => {
-      document.querySelectorAll(selector).forEach(element => result.add(element));
-    });
-    return [...result];
-  }
-
-  function mobileListAuthor(container) {
-    if (!container.matches('.gall-detail-lst > li, #view_next > li')) return null;
-    return container.querySelector(':scope > ul.ginfo > li:nth-child(2)')
-      || container.querySelector('ul.ginfo > li:nth-child(2)');
-  }
-
-  function commentTextAuthor(container) {
-    if (!container.matches('.all-comment-lst > li[id^="comment_cnt_"]')) return null;
-
-    const lines = String(container.innerText || '')
-      .split(/\n+/)
-      .map(line => line.trim())
-      .filter(Boolean);
-
-    const firstLine = lines[0] || '';
-    if (!firstLine) return null;
-
-    let marker = container.querySelector(':scope > .dcub-text-author');
-    if (!marker) {
-      marker = document.createElement('span');
-      marker.className = 'dcub-text-author';
-      marker.textContent = firstLine;
-      marker.style.display = 'none';
-      container.prepend(marker);
-    }
-    return marker;
-  }
-
-  function authorIn(container) {
-    const mobileAuthor = mobileListAuthor(container);
-    if (mobileAuthor) return mobileAuthor;
-
-    for (const selector of AUTHOR_SELECTORS) {
-      const found = container.querySelector(selector);
-      if (found && normalize(found.textContent)) return found;
-    }
-
-    return commentTextAuthor(container);
-  }
-
-  function updateContainerVisibility(container) {
-    const hidden =
-      container.dataset.dcubLocalBlocked === '1'
-      || container.dataset.dcubRemoteBlocked === '1';
-
-    container.classList.toggle(HIDDEN_CLASS, hidden);
-  }
-
-  function processContainer(container, force = false) {
-    if (!force && container.getAttribute(DONE_ATTRIBUTE) === '1') return;
-    container.setAttribute(DONE_ATTRIBUTE, '1');
-
-    const author = authorIn(container);
-    const user = getUser(author, container);
-
-    container.dataset.dcubLocalBlocked = user && isBlocked(user) ? '1' : '0';
-    updateContainerVisibility(container);
-  }
-
-  async function enrichMobileBlocks() {
-    if (!isMobile) return;
-
-    const containers = contentContainers();
-    containers.forEach(container => {
-      container.dataset.dcubRemoteBlocked = '0';
-      updateContainerVisibility(container);
-    });
-
-    if (!hasUidBlocks()) return;
-
-    const postContainers = containers.filter(container => !isCommentContainer(container));
-    const listContext = contextFromURL(location.href);
-
-    if (listContext && !listContext.postNo && postContainers.length) {
-      try {
-        const listMap = await fetchDesktopList(listContext);
-        for (const container of postContainers) {
-          const postNo = postNoFromElement(container);
-          const user = listMap.get(postNo);
-          container.dataset.dcubRemoteBlocked = user && isBlocked(user) ? '1' : '0';
-          updateContainerVisibility(container);
-        }
-      } catch (error) {
-        console.warn('[DCUB] 모바일 목록 ID 조회 실패:', error);
-      }
-    }
-
-    const commentContainers = containers.filter(isCommentContainer);
-    const detailContext = contextFromURL(location.href);
-
-    if (detailContext?.postNo && commentContainers.length) {
-      try {
-        const commentMap = await fetchDesktopComments(detailContext);
-        for (const container of commentContainers) {
-          const commentNo = commentNoFromElement(container);
-          const user = commentMap.get(commentNo);
-          container.dataset.dcubRemoteBlocked = user && isBlocked(user) ? '1' : '0';
-          updateContainerVisibility(container);
-        }
-      } catch (error) {
-        console.warn('[DCUB] 모바일 댓글 ID 조회 실패:', error);
-      }
-    }
-  }
-
-  function scheduleEnrichment() {
-    clearTimeout(enrichmentTimer);
-    enrichmentTimer = window.setTimeout(() => enrichMobileBlocks(), 180);
-  }
-
-  function scan(force = false) {
-    contentContainers().forEach(container => processContainer(container, force));
-    document.querySelectorAll('.block-disable').forEach(element => element.classList.add(HIDDEN_CLASS));
-    mountFooterGear();
-    scheduleEnrichment();
-  }
-
-  function scheduleScan() {
-    clearTimeout(scanTimer);
-    scanTimer = window.setTimeout(() => scan(), 100);
-  }
-
-  function toast(message, duration = 1800) {
-    document.getElementById('dcub-toast')?.remove();
-    const element = document.createElement('div');
-    element.id = 'dcub-toast';
-    element.textContent = message;
-    document.body.appendChild(element);
-    window.setTimeout(() => element.remove(), duration);
-  }
-
-  function renderPanelList() {
-    const list = document.querySelector('#dcub-panel .dcub-list');
-    if (!list) return;
-
-    if (!blockedUsers.length) {
-      list.innerHTML = '<div class="dcub-empty">차단된 사용자가 없습니다.</div>';
-      return;
-    }
-
-    list.innerHTML = blockedUsers.map((item, index) => `
-      <div class="dcub-item">
-        <div>
-          <b>${escapeHTML(blockLabel(item))}</b>
-          <small>${item.type === 'ip' ? '유동 IP' : item.type === 'uid' ? '고닉·반고닉 ID' : item.type === 'nick' ? '닉네임' : 'ID · 닉네임 자동 판별'}</small>
-        </div>
-        <button type="button" data-index="${index}">해제</button>
-      </div>
-    `).join('');
-
-    list.querySelectorAll('[data-index]').forEach(button => {
-      button.addEventListener('click', () => removeBlockedUser(Number(button.dataset.index)));
-    });
-  }
-
-  function createPanel() {
-    if (document.getElementById('dcub-panel')) return;
-
-    const panel = document.createElement('div');
-    panel.id = 'dcub-panel';
-    panel.innerHTML = `
-      <div class="dcub-box">
-        <header>
-          <b>유저 차단 설정</b>
-          <button type="button" class="dcub-close" aria-label="닫기">×</button>
-        </header>
-
-        <div class="dcub-pick-section">
-          <button type="button" id="dcub-pick-user">
-            <span class="dcub-pick-icon">◎</span>
-            <span>
-              <b>화면에서 사용자 선택</b>
-              <small>모바일 반고닉도 PC 페이지에서 ID를 자동 확인합니다.</small>
-            </span>
-          </button>
-        </div>
-
-        <div class="dcub-entry">
-          <div class="dcub-entry-row">
-            <select id="dcub-type" aria-label="차단 기준">
-              <option value="auto">자동 판별</option>
-              <option value="ip">유동 IP</option>
-              <option value="uid">고닉 ID</option>
-              <option value="nick">닉네임</option>
-            </select>
-            <input id="dcub-input" type="text" autocomplete="off" autocapitalize="none" placeholder="ㅇㅇ(211.245) 또는 @고닉ID">
-            <button type="button" id="dcub-add">등록</button>
-          </div>
-          <p id="dcub-help"><b>‘화면에서 사용자 선택’을 권장합니다.</b> 반고닉 ㅇㅇ은 PC용 게시글·댓글 데이터에서 실제 ID를 찾아 등록합니다.</p>
-        </div>
-
-        <div class="dcub-list"></div>
-        <footer><button type="button" class="dcub-clear">전체 해제</button></footer>
-      </div>`;
-
-    document.body.appendChild(panel);
-
-    const input = panel.querySelector('#dcub-input');
-    const type = panel.querySelector('#dcub-type');
-    const help = panel.querySelector('#dcub-help');
-
-    const hints = {
-      auto: ['ㅇㅇ(211.245) 또는 @고닉ID', '<b>‘화면에서 사용자 선택’을 권장합니다.</b> 반고닉 ㅇㅇ도 실제 ID를 자동 조회합니다.'],
-      ip: ['211.245 또는 ㅇㅇ(211.245)', '화면에 표시된 유동 IP를 입력합니다. 같은 표시 IP 사용자가 함께 차단될 수 있습니다.'],
-      uid: ['고닉·반고닉의 갤로그 ID', '직접 알기 어려우면 ‘화면에서 사용자 선택’을 사용해 주세요.'],
-      nick: ['차단할 닉네임', '닉네임 차단은 같은 이름을 쓰는 다른 사용자도 함께 숨길 수 있습니다.']
-    };
-
-    type.addEventListener('change', () => {
-      input.placeholder = hints[type.value][0];
-      help.innerHTML = hints[type.value][1];
-    });
-
-    panel.querySelector('.dcub-close').addEventListener('click', () => panel.classList.remove('open'));
-    panel.addEventListener('click', event => {
-      if (event.target === panel) panel.classList.remove('open');
-    });
-
-    panel.querySelector('#dcub-pick-user').addEventListener('click', () => {
-      panel.classList.remove('open');
-      beginSelectionMode();
-    });
-
-    const submit = () => {
-      if (addEntries(input.value, type.value)) input.value = '';
-      input.focus();
-    };
-
-    panel.querySelector('#dcub-add').addEventListener('click', submit);
-    input.addEventListener('keydown', event => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        submit();
-      }
-    });
-
-    panel.querySelector('.dcub-clear').addEventListener('click', () => {
-      if (!blockedUsers.length || !confirm('차단 목록을 전부 삭제하시겠습니까?')) return;
-      blockedUsers = [];
-      save();
-      scan(true);
-      renderPanelList();
-    });
-  }
-
-  function footerScore(element) {
-    if (!element || element.closest('#dcub-panel')) return -100;
-    if (element.closest('article, .gallview, .gallview_contents, .view_content, .view_content_wrap, .movie, .video')) return -100;
-
-    const value = normalize(element.textContent).toLocaleLowerCase();
-    let score = 0;
-    if (value.includes('copyright')) score += 8;
-    if (value.includes('개인정보처리방침')) score += 5;
-    if (value.includes('회사소개')) score += 3;
-    if (value.includes('dcinside.com')) score += 3;
-    if (value.includes('이용약관')) score += 2;
-    if (element.id?.toLocaleLowerCase().includes('footer')) score += 3;
-    if (String(element.className).toLocaleLowerCase().includes('footer')) score += 2;
-    return score;
-  }
-
-  function findSiteFooter() {
-    const selectors = [
-      '#footer', '.footer', '.footer_wrap', '.footer-area', '.footer_area',
-      '.m-footer', '.m_footer', '.dc-footer', 'body > footer'
-    ];
-
-    const candidates = new Set();
-    selectors.forEach(selector => document.querySelectorAll(selector).forEach(element => candidates.add(element)));
-
-    document.querySelectorAll('body > div, body > section').forEach(element => {
-      const value = normalize(element.textContent);
-      if (/Copyright/i.test(value) && /dcinside/i.test(value)) candidates.add(element);
-    });
-
-    return [...candidates]
-      .map(element => ({ element, score: footerScore(element) }))
-      .filter(item => item.score >= 8)
-      .sort((a, b) => b.score - a.score)[0]?.element || null;
-  }
-
-  function openPanel() {
-    const panel = document.getElementById('dcub-panel');
-    if (!panel) return;
-    cancelSelectionMode(false);
-    renderPanelList();
-    panel.classList.add('open');
-  }
-
-  function mountFooterGear() {
-    const existing = document.getElementById('dcub-footer-settings');
-    const footer = findSiteFooter();
-
-    if (!footer) {
-      existing?.remove();
-      return false;
-    }
-
-    if (existing && existing.parentElement === footer) return true;
-    existing?.remove();
-
-    footer.classList.add('dcub-site-footer');
-
-    const holder = document.createElement('div');
-    holder.id = 'dcub-footer-settings';
-    holder.innerHTML = `
-      <button type="button" id="dcub-open" aria-label="유저 차단 설정" title="유저 차단 설정">
-        <svg viewBox="0 0 24 24" width="21" height="21" fill="currentColor" aria-hidden="true">
-          <path d="M19.14 12.94a7.43 7.43 0 0 0 .05-.94 7.43 7.43 0 0 0-.05-.94l2.03-1.58a.48.48 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54A.48.48 0 0 0 13.93 2h-3.84a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.73 8.47a.48.48 0 0 0 .12.61l2.03 1.58c-.04.3-.06.62-.06.94s.02.64.06.94l-2.03 1.58a.48.48 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.48.48 0 0 0-.12-.61l-2.03-1.58ZM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2Z"/>
-        </svg>
-      </button>`;
-
-    holder.querySelector('#dcub-open').addEventListener('click', openPanel);
-    footer.appendChild(holder);
-    return true;
-  }
-
-  function selectionBar(message = '차단할 작성자 이름을 눌러주세요.') {
-    let bar = document.getElementById('dcub-selection-bar');
-    if (!bar) {
-      bar = document.createElement('div');
-      bar.id = 'dcub-selection-bar';
-      bar.innerHTML = '<span></span><button type="button">취소</button>';
-      bar.querySelector('button').addEventListener('click', () => cancelSelectionMode());
-      document.body.appendChild(bar);
-    }
-    bar.querySelector('span').textContent = message;
-    return bar;
-  }
-
-  function beginSelectionMode() {
-    selectionMode = true;
-    selectionBusy = false;
-    document.documentElement.classList.add('dcub-selecting');
-    selectionBar();
-    clearTimeout(selectionTimeout);
-    selectionTimeout = window.setTimeout(() => cancelSelectionMode(), 30000);
-  }
-
-  function cancelSelectionMode(showMessage = true) {
-    if (!selectionMode && !document.getElementById('dcub-selection-bar')) return;
-    selectionMode = false;
-    selectionBusy = false;
-    clearTimeout(selectionTimeout);
-    document.documentElement.classList.remove('dcub-selecting');
-    document.getElementById('dcub-selection-bar')?.remove();
-    if (showMessage) toast('사용자 선택을 취소했습니다.');
-  }
-
-  function articleAuthorFromTarget(target) {
-    const articleHeader = target.closest('.gallview-tit-box, .gallview_head');
-    if (!articleHeader) return null;
-
-    const author = articleHeader.querySelector('.ginfo2 > li:first-child, .gall_writer, [data-nick], [data-uid], [data-ip]');
-    return author ? { author, container: articleHeader } : null;
-  }
-
-  function selectionTarget(target) {
-    const container = target.closest(CONTAINER_SELECTORS.join(','));
-    if (container) {
-      const author = authorIn(container);
-      if (author && (author === target || author.contains(target))) return { author, container };
-    }
-
-    const article = articleAuthorFromTarget(target);
-    if (article && (article.author === target || article.author.contains(target))) return article;
-
-    for (const selector of AUTHOR_SELECTORS) {
-      const author = target.closest(selector);
-      if (!author) continue;
-      const parentContainer =
-        author.closest(CONTAINER_SELECTORS.join(','))
-        || author.closest('.gallview-tit-box, .gallview_head')
-        || author;
-      return { author, container: parentContainer };
-    }
-
-    return null;
-  }
-
-  async function resolveSelectedUser(selected) {
-    const local = getUser(selected.author, selected.container) || {};
-    if (local.uid || local.ip) return local;
-
-    const context = contextForContainer(selected.container);
-    if (!context) return local;
-
-    if (isCommentContainer(selected.container)) {
-      const commentNo = commentNoFromElement(selected.container);
-      if (!commentNo) return local;
-
-      const comments = await fetchDesktopComments(context);
-      return comments.get(commentNo) || local;
-    }
-
-    if (!context.postNo) {
-      context.postNo = postNoFromElement(selected.container);
-    }
-
-    if (!context.postNo) return local;
-
-    const post = await fetchDesktopPost(context);
-    return post.user || local;
-  }
-
-  async function handleSelectionTap(event) {
-    if (!selectionMode || selectionBusy) return;
-    if (event.target.closest('#dcub-selection-bar, #dcub-panel, #dcub-footer-settings')) return;
-
-    const selected = selectionTarget(event.target);
-    if (!selected) {
-      toast('글 제목이 아니라 작성자 이름을 눌러주세요.');
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-
-    selectionBusy = true;
-    selectionBar('PC 데이터에서 작성자 ID 확인 중…');
-
-    try {
-      const user = await resolveSelectedUser(selected);
-      const entry = selectedUserEntry(user);
-
-      if (entry.error) {
-        alert(`${entry.error}\n\n유니콘 PRO에서 이 스크립트의 gall.dcinside.com 접근 권한도 확인해 주세요.`);
-        cancelSelectionMode(false);
-        return;
-      }
-
-      const basis =
-        entry.type === 'uid' ? '고닉·반고닉 ID'
-          : entry.type === 'ip' ? '유동 IP'
-            : '닉네임';
-
-      if (!confirm(`${entry.label} 사용자를 차단하시겠습니까?\n\n차단 기준: ${basis}`)) {
-        cancelSelectionMode(false);
-        return;
-      }
-
-      addEntry(entry);
-      cancelSelectionMode(false);
-    } catch (error) {
-      console.warn('[DCUB] 작성자 ID 조회 실패:', error);
-      alert(
-        `작성자 ID를 조회하지 못했습니다.\n\n${error.message || error}\n\n` +
-        '유니콘 PRO에서 이 스크립트의 gall.dcinside.com 사이트 접근 권한을 허용했는지 확인해 주세요.'
-      );
-      cancelSelectionMode(false);
-    }
-  }
-
-  function injectStyle() {
-    if (document.getElementById('dcub-style')) return;
-
-    const style = document.createElement('style');
-    style.id = 'dcub-style';
-    style.textContent = `
-      .${HIDDEN_CLASS}, .block-disable { display: none !important; }
-
-      .dcub-site-footer { position: relative !important; }
-      #dcub-footer-settings {
-        position: absolute !important;
-        right: 16px !important;
-        bottom: 72px !important;
-        z-index: 5 !important;
-      }
-      #dcub-open {
-        all: unset !important;
-        box-sizing: border-box !important;
-        display: inline-flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        width: 36px !important;
-        height: 36px !important;
-        border-radius: 8px !important;
-        color: rgba(255,255,255,.72) !important;
-        background: rgba(255,255,255,.08) !important;
-        cursor: pointer !important;
-      }
-      #dcub-open:active { background: rgba(255,255,255,.18) !important; color: #fff !important; }
-
-      #dcub-panel {
-        display: none;
-        position: fixed !important;
-        inset: 0 !important;
-        z-index: 2147483646 !important;
-        background: rgba(0,0,0,.52) !important;
-        font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif !important;
-      }
-      #dcub-panel.open { display: block !important; }
-      #dcub-panel .dcub-box {
-        position: absolute !important;
-        top: 50% !important;
-        left: 50% !important;
-        transform: translate(-50%, -50%) !important;
-        width: min(92vw, 430px) !important;
-        max-height: 84vh !important;
-        overflow: hidden !important;
-        border-radius: 12px !important;
-        background: #fff !important;
-        color: #222 !important;
-        box-shadow: 0 12px 40px rgba(0,0,0,.4) !important;
-      }
-      #dcub-panel header, #dcub-panel footer {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: space-between !important;
-        padding: 13px 15px !important;
-        border-bottom: 1px solid #ddd !important;
-      }
-      #dcub-panel footer {
-        justify-content: flex-end !important;
-        border-top: 1px solid #ddd !important;
-        border-bottom: 0 !important;
-      }
-      #dcub-panel .dcub-close {
-        border: 0 !important;
-        background: transparent !important;
-        color: inherit !important;
-        font-size: 24px !important;
-        line-height: 1 !important;
-        cursor: pointer !important;
-      }
-
-      #dcub-panel .dcub-pick-section {
-        padding: 12px 15px !important;
-        border-bottom: 1px solid #eee !important;
-      }
-      #dcub-panel #dcub-pick-user {
-        width: 100% !important;
-        display: flex !important;
-        align-items: center !important;
-        gap: 10px !important;
-        box-sizing: border-box !important;
-        padding: 11px 12px !important;
-        border: 1px solid #c9ccda !important;
-        border-radius: 8px !important;
-        background: #f7f8fc !important;
-        color: #30364f !important;
-        text-align: left !important;
-        cursor: pointer !important;
-      }
-      #dcub-panel .dcub-pick-icon { font-size: 22px !important; color: #3b4890 !important; }
-      #dcub-panel #dcub-pick-user small {
-        display: block !important;
-        margin-top: 3px !important;
-        color: #7c8192 !important;
-        font-size: 11px !important;
-        font-weight: 400 !important;
-      }
-
-      #dcub-panel .dcub-entry {
-        padding: 13px 15px 10px !important;
-        border-bottom: 1px solid #eee !important;
-      }
-      #dcub-panel .dcub-entry-row { display: flex !important; gap: 6px !important; }
-      #dcub-panel #dcub-type {
-        flex: 0 0 92px !important;
-        height: 38px !important;
-        box-sizing: border-box !important;
-        border: 1px solid #cfd1da !important;
-        border-radius: 6px !important;
-        background: #fff !important;
-        color: #333 !important;
-        font-size: 12px !important;
-      }
-      #dcub-panel #dcub-input {
-        flex: 1 !important;
-        min-width: 0 !important;
-        height: 38px !important;
-        box-sizing: border-box !important;
-        padding: 8px 10px !important;
-        border: 1px solid #cfd1da !important;
-        border-radius: 6px !important;
-        background: #fff !important;
-        color: #222 !important;
-        font-size: 14px !important;
-        outline: none !important;
-      }
-      #dcub-panel #dcub-input:focus { border-color: #3b4890 !important; }
-      #dcub-panel #dcub-add {
-        flex: 0 0 52px !important;
-        height: 38px !important;
-        border: 0 !important;
-        border-radius: 6px !important;
-        background: #3b4890 !important;
-        color: #fff !important;
-        font-size: 13px !important;
-        font-weight: 700 !important;
-        cursor: pointer !important;
-      }
-      #dcub-panel .dcub-entry p {
-        margin: 8px 1px 0 !important;
-        color: #858895 !important;
-        font-size: 11px !important;
-        line-height: 1.45 !important;
-      }
-      #dcub-panel .dcub-list {
-        max-height: 40vh !important;
-        overflow-y: auto !important;
-        padding: 5px 15px !important;
-      }
-      #dcub-panel .dcub-item {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: space-between !important;
-        gap: 10px !important;
-        padding: 10px 0 !important;
-        border-bottom: 1px solid #eee !important;
-        font-size: 13px !important;
-      }
-      #dcub-panel .dcub-item small {
-        display: block !important;
-        margin-top: 2px !important;
-        color: #888 !important;
-        font-size: 11px !important;
-      }
-      #dcub-panel .dcub-item button, #dcub-panel .dcub-clear {
-        padding: 5px 8px !important;
-        border: 1px solid #aaa !important;
-        border-radius: 5px !important;
-        background: #fff !important;
-        color: #444 !important;
-        cursor: pointer !important;
-      }
-      #dcub-panel .dcub-empty {
-        padding: 28px 0 !important;
-        color: #888 !important;
-        text-align: center !important;
-      }
-
-      #dcub-selection-bar {
-        position: fixed !important;
-        left: 50% !important;
-        bottom: calc(18px + env(safe-area-inset-bottom)) !important;
-        transform: translateX(-50%) !important;
-        z-index: 2147483647 !important;
-        display: flex !important;
-        align-items: center !important;
-        gap: 10px !important;
-        max-width: calc(100vw - 24px) !important;
-        box-sizing: border-box !important;
-        padding: 9px 10px 9px 14px !important;
-        border-radius: 10px !important;
-        background: rgba(25,27,34,.94) !important;
-        color: #fff !important;
-        box-shadow: 0 6px 24px rgba(0,0,0,.28) !important;
-        font-size: 12px !important;
-        white-space: nowrap !important;
-      }
-      #dcub-selection-bar button {
-        border: 0 !important;
-        border-radius: 6px !important;
-        padding: 5px 8px !important;
-        background: rgba(255,255,255,.16) !important;
-        color: #fff !important;
-        cursor: pointer !important;
-      }
-      .dcub-selecting .gall-detail-lst > li .ginfo > li:nth-child(2),
-      .dcub-selecting #view_next > li .ginfo > li:nth-child(2),
-      .dcub-selecting .gall_writer,
-      .dcub-selecting .nickname,
-      .dcub-selecting .nick_name,
-      .dcub-selecting [data-nick],
-      .dcub-selecting [data-uid],
-      .dcub-selecting [data-ip] {
-        outline: 1px dashed rgba(59,72,144,.42) !important;
-        outline-offset: 2px !important;
-      }
-
-      #dcub-toast {
-        position: fixed !important;
-        left: 50% !important;
-        bottom: calc(72px + env(safe-area-inset-bottom)) !important;
-        transform: translateX(-50%) !important;
-        z-index: 2147483647 !important;
-        padding: 9px 14px !important;
-        border-radius: 8px !important;
-        background: rgba(20,20,20,.92) !important;
-        color: #fff !important;
-        font-size: 13px !important;
-        white-space: nowrap !important;
-        pointer-events: none !important;
-      }
-
-      @media (prefers-color-scheme: dark) {
-        #dcub-panel .dcub-box { background: #252525 !important; color: #eee !important; }
-        #dcub-panel header,
-        #dcub-panel footer,
-        #dcub-panel .dcub-pick-section,
-        #dcub-panel .dcub-entry,
-        #dcub-panel .dcub-item { border-color: #444 !important; }
-        #dcub-panel #dcub-pick-user { background: #303138 !important; color: #eee !important; border-color: #565a68 !important; }
-        #dcub-panel #dcub-type,
-        #dcub-panel #dcub-input { background: #303030 !important; color: #eee !important; border-color: #5b5d65 !important; }
-        #dcub-panel .dcub-item button,
-        #dcub-panel .dcub-clear { background: #333 !important; color: #eee !important; border-color: #666 !important; }
-      }
-    `;
-
-    document.documentElement.appendChild(style);
-  }
-
-  function init() {
-    if (!document.body) {
-      document.addEventListener('DOMContentLoaded', init, { once: true });
-      return;
-    }
-
-    injectStyle();
-    createPanel();
-    mountFooterGear();
-    scan(true);
-
-    document.addEventListener('click', handleSelectionTap, true);
-
-    const observer = new MutationObserver(mutations => {
-      if (mutations.some(mutation => [...mutation.addedNodes].some(node => node.nodeType === 1))) {
-        scheduleScan();
-      }
-    });
-
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    window.setInterval(() => scan(), isMobile ? 2500 : 4000);
-
-    console.info('[DCUB] v1.5.0 실행됨');
-  }
-
-  init();
+  return null;
+}
+async function runBridge(p){
+  if(!p?.token||location.hostname!=='gall.dcinside.com')return false;
+  const done=o=>{setC(`${RC}${p.token}`,JSON.stringify(o),90);document.title=o.ok?'작성자 확인 완료':'작성자 확인 실패';setTimeout(()=>{try{window.close()}catch(_){}},150)};
+  const work=async()=>{try{const u=p.mode==='comment'?await bridgeComment(p):user(writer(document.querySelector('.gallview_head'))),e=entry(u);done(e?{ok:true,entry:e}:{ok:false,error:'PC 페이지에서도 식별 정보를 찾지 못했습니다.'})}catch(e){done({ok:false,error:e.message||String(e)})}};
+  document.readyState==='loading'?document.addEventListener('DOMContentLoaded',work,{once:true}):work();
+  return true;
+}
+function selectedContext(box){
+  const c=context();if(!c)return null;
+  const isC=CMT.some(s=>box.matches(s));
+  return isC?{...c,mode:'comment',commentNo:commentNo(box)}:{...c,mode:'post',postNo:postNo(box)||c.postNo};
+}
+function bridgeURL(c,t){
+  const h=new URLSearchParams({[BH]:t,mode:c.mode,gallery:c.gallery,postNo:c.postNo,gallType:gt(c.type)});
+  if(c.commentNo)h.set('commentNo',c.commentNo);
+  return`${prefix(c.type)}board/view/?id=${encodeURIComponent(c.gallery)}&no=${encodeURIComponent(c.postNo)}#${h}`;
+}
+function waitResult(t,w){return new Promise((res,rej)=>{const n=RC+t,start=Date.now(),iv=setInterval(()=>{const r=ck(n);if(r){clearInterval(iv);delC(n);res(json(r,{ok:false,error:'응답 오류'}))}else if(Date.now()-start>20000){clearInterval(iv);try{w?.close()}catch(_){}rej(new Error('작성자 확인 시간이 초과되었습니다.'))}},250)})}
+async function lookup(c){
+  if(!c?.gallery||!c?.postNo)throw new Error('선택한 글 번호를 찾지 못했습니다.');
+  if(c.mode==='comment'&&!c.commentNo)throw new Error('선택한 댓글 번호를 찾지 못했습니다.');
+  const t=Date.now().toString(36)+Math.random().toString(36).slice(2,8),w=window.open(bridgeURL(c,t),`dcub_${t}`);
+  if(!w)throw new Error('새 탭이 차단되었습니다. Safari의 팝업 차단을 잠시 해제해 주세요.');
+  const r=await waitResult(t,w);if(!r?.ok||!r.entry)throw new Error(r?.error||'작성자 식별 실패');return r.entry;
+}
+function boxes(){
+  const s=new Set();ALL.forEach(q=>document.querySelectorAll(q).forEach(e=>s.add(e)));
+  const h=document.querySelector('.gallview-tit-box,.gallview_head');if(h)s.add(h);return[...s];
+}
+function picks(){
+  document.querySelectorAll('.dcub-pickable').forEach(e=>{e.classList.remove('dcub-pickable');delete e.dataset.dcubPickLabel});
+  if(!selecting)return;
+  boxes().forEach(e=>{e.classList.add('dcub-pickable');e.dataset.dcubPickLabel=CMT.some(s=>e.matches(s))?'댓글 선택':'글 선택'});
+}
+function bar(msg='차단할 글이나 댓글 한 줄을 누르세요. 링크는 열리지 않습니다.'){
+  let b=document.getElementById('dcub-selection-bar');
+  if(!b){b=document.createElement('div');b.id='dcub-selection-bar';b.innerHTML='<span></span><button type="button">취소</button>';b.querySelector('button').onclick=()=>cancel();document.body.appendChild(b)}
+  b.querySelector('span').textContent=msg;return b;
+}
+function begin(){selecting=true;busy=false;document.documentElement.classList.add('dcub-selecting');picks();bar()}
+function cancel(){selecting=false;busy=false;document.documentElement.classList.remove('dcub-selecting');document.getElementById('dcub-selection-bar')?.remove();picks()}
+async function selectClick(ev){
+  if(!selecting||busy||ev.target.closest('#dcub-panel,#dcub-selection-bar,#dcub-footer-settings'))return;
+  const box=ev.target.closest('.dcub-pickable');
+  ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();
+  if(!box){toast('표시된 글 또는 댓글 영역을 눌러주세요.');return}
+  busy=true;bar('작성자 정보를 확인하고 있습니다…');
+  try{
+    let e=entry(user(writer(box))),c=selectedContext(box);
+    if(!e||e.type==='nick'){bar('PC 화면에서 ID를 확인 중입니다. 새 탭이 잠깐 열릴 수 있습니다…');e=await lookup(c)}
+    const basis=e.type==='uid'?'식별 코드':e.type==='ip'?'유동 IP':'닉네임';
+    if(confirm(`${e.label} 사용자를 차단하시겠습니까?\n\n차단 기준: ${basis}`)&&add(e))box.classList.add('dcub-hide');
+    cancel();
+  }catch(e){alert(`작성자를 확인하지 못했습니다.\n\n${e.message||e}\n\n새 탭이 열리지 않았다면 Safari의 팝업 차단을 잠시 해제해 주세요.`);cancel()}
+}
+function render(){
+  const el=document.querySelector('#dcub-panel .dcub-list');if(!el)return;
+  const m=managed();
+  if(!m.length){el.innerHTML='<div class="dcub-empty">이 스크립트에서 추가한 차단 사용자가 없습니다.</div>';return}
+  el.innerHTML=m.map((x,i)=>`<div class="dcub-item"><div><b>${esc(x.label||x.value)}</b><small>${x.type==='uid'?'식별 코드':x.type==='ip'?'유동 IP':'닉네임'}</small></div><button data-i="${i}">해제</button></div>`).join('');
+  el.querySelectorAll('[data-i]').forEach(b=>b.onclick=()=>{const x=m[+b.dataset.i];if(x)remove(x.type,x.value)});
+}
+function panel(){
+  if(document.getElementById('dcub-panel'))return;
+  const p=document.createElement('div');p.id='dcub-panel';p.innerHTML=`<div class="dcub-box"><header><b>유저 차단 설정</b><button class="dcub-close">×</button></header><div class="dcub-pick-section"><button id="dcub-pick-user"><span class="dcub-pick-icon">◎</span><span><b>화면에서 글·댓글 선택</b><small>작성자 이름이 아니라 글 한 줄 아무 곳이나 누릅니다.</small></span></button></div><div class="dcub-entry"><div class="dcub-entry-row"><select id="dcub-type"><option value="auto">자동 판별</option><option value="ip">유동 IP</option><option value="uid">식별 코드</option><option value="nick">닉네임</option></select><input id="dcub-input" placeholder="ㅇㅇ(211.245) 또는 @아이디"><button id="dcub-add">등록</button></div><p>반고닉 ㅇㅇ은 화면 선택을 사용하면 임시 PC 탭에서 실제 식별 코드를 확인합니다.</p></div><div class="dcub-list"></div><footer><button class="dcub-native">디시 차단 설정</button><button class="dcub-clear">전체 해제</button></footer></div>`;
+  document.body.appendChild(p);
+  const input=p.querySelector('#dcub-input'),type=p.querySelector('#dcub-type'),submit=()=>{const e=manual(input.value,type.value);if(e?.error)return alert(e.error);if(e&&add(e))input.value=''};
+  p.querySelector('.dcub-close').onclick=()=>p.classList.remove('open');
+  p.onclick=e=>{if(e.target===p)p.classList.remove('open')};
+  p.querySelector('#dcub-pick-user').onclick=()=>{p.classList.remove('open');begin()};
+  p.querySelector('#dcub-add').onclick=submit;
+  input.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();submit()}};
+  p.querySelector('.dcub-native').onclick=()=>{const c=context();if(c)location.href=`https://m.dcinside.com/userBlock/common/${c.type==='mini'?'mini':'board'}/${encodeURIComponent(c.gallery)}`};
+  p.querySelector('.dcub-clear').onclick=()=>{const m=managed();if(!m.length||!confirm('이 스크립트에서 등록한 차단을 모두 해제하시겠습니까?'))return;const c=cfg();m.forEach(x=>{const f=field(x.type);c[f]=arr(c[f]).filter(v=>low(v)!==low(x.value)).join('||')});saveCfg(c);saveManaged([]);render();toast('모두 해제했습니다.')};
+}
+function footer(){
+  const candidates=new Set();['#footer','.footer','.footer_wrap','.footer-area','.footer_area','.m-footer','.m_footer','.dc-footer','body>footer'].forEach(s=>document.querySelectorAll(s).forEach(e=>candidates.add(e)));
+  document.querySelectorAll('body>div,body>section').forEach(e=>{const t=norm(e.textContent);if(/Copyright/i.test(t)&&/dcinside/i.test(t))candidates.add(e)});
+  return[...candidates].map(e=>{if(e.closest('article,.gallview,.gallview_contents,.view_content,.view_content_wrap,.movie,.video'))return{e,s:-99};const t=low(e.textContent);let s=0;if(t.includes('copyright'))s+=8;if(t.includes('개인정보처리방침'))s+=5;if(t.includes('회사소개'))s+=3;if(t.includes('dcinside.com'))s+=3;if(t.includes('이용약관'))s+=2;if(low(e.id).includes('footer'))s+=3;if(low(e.className).includes('footer'))s+=2;return{e,s}}).filter(x=>x.s>=8).sort((a,b)=>b.s-a.s)[0]?.e||null;
+}
+function gear(){
+  const old=document.getElementById('dcub-footer-settings'),f=footer();
+  if(!f){old?.remove();return}if(old?.parentElement===f)return;old?.remove();f.classList.add('dcub-site-footer');
+  const h=document.createElement('div');h.id='dcub-footer-settings';h.innerHTML='<button id="dcub-open" aria-label="유저 차단 설정">⚙</button>';h.querySelector('button').onclick=()=>{cancel();render();document.getElementById('dcub-panel')?.classList.add('open')};f.appendChild(h);
+}
+function scan(){document.querySelectorAll('.block-disable').forEach(e=>e.classList.add('dcub-hide'));gear();picks()}
+function toast(s){document.getElementById('dcub-toast')?.remove();const e=document.createElement('div');e.id='dcub-toast';e.textContent=s;document.body.appendChild(e);setTimeout(()=>e.remove(),1800)}
+function css(){
+  if(document.getElementById('dcub-style'))return;
+  const s=document.createElement('style');s.id='dcub-style';s.textContent=`
+.dcub-hide,.block-disable{display:none!important}.dcub-site-footer{position:relative!important}#dcub-footer-settings{position:absolute!important;right:16px!important;bottom:72px!important;z-index:5!important}#dcub-open{all:unset!important;display:flex!important;align-items:center!important;justify-content:center!important;width:36px!important;height:36px!important;border-radius:8px!important;background:#ffffff14!important;color:#ffffffb8!important;font-size:19px!important;cursor:pointer!important}
+#dcub-panel{display:none;position:fixed!important;inset:0!important;z-index:2147483646!important;background:#0008!important;font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif!important}#dcub-panel.open{display:block!important}.dcub-box{position:absolute!important;top:50%!important;left:50%!important;transform:translate(-50%,-50%)!important;width:min(92vw,430px)!important;max-height:84vh!important;overflow:hidden!important;border-radius:12px!important;background:#fff!important;color:#222!important;box-shadow:0 12px 40px #0006!important}.dcub-box header,.dcub-box footer{display:flex!important;align-items:center!important;justify-content:space-between!important;gap:6px!important;padding:13px 15px!important;border-bottom:1px solid #ddd!important}.dcub-box footer{justify-content:flex-end!important;border-top:1px solid #ddd!important;border-bottom:0!important}.dcub-close{border:0!important;background:none!important;color:inherit!important;font-size:24px!important}.dcub-pick-section{padding:12px 15px!important;border-bottom:1px solid #eee!important}#dcub-pick-user{width:100%!important;display:flex!important;align-items:center!important;gap:10px!important;padding:11px 12px!important;border:1px solid #c9ccda!important;border-radius:8px!important;background:#f7f8fc!important;color:#30364f!important;text-align:left!important}.dcub-pick-icon{font-size:22px!important;color:#3b4890!important}#dcub-pick-user small{display:block!important;margin-top:3px!important;color:#7c8192!important;font-size:11px!important}.dcub-entry{padding:13px 15px 10px!important;border-bottom:1px solid #eee!important}.dcub-entry-row{display:flex!important;gap:6px!important}#dcub-type{flex:0 0 88px!important;height:38px!important}#dcub-input{flex:1!important;min-width:0!important;height:38px!important;box-sizing:border-box!important;padding:8px!important}#dcub-add{flex:0 0 52px!important;height:38px!important;border:0!important;border-radius:6px!important;background:#3b4890!important;color:#fff!important;font-weight:700!important}.dcub-entry p{margin:8px 1px 0!important;color:#858895!important;font-size:11px!important;line-height:1.45!important}.dcub-list{max-height:38vh!important;overflow:auto!important;padding:5px 15px!important}.dcub-item{display:flex!important;align-items:center!important;justify-content:space-between!important;padding:10px 0!important;border-bottom:1px solid #eee!important;font-size:13px!important}.dcub-item small{display:block!important;margin-top:2px!important;color:#888!important;font-size:11px!important}.dcub-item button,.dcub-box footer button{padding:5px 8px!important;border:1px solid #aaa!important;border-radius:5px!important;background:#fff!important;color:#444!important;font-size:11px!important}.dcub-empty{padding:28px 0!important;color:#888!important;text-align:center!important}
+#dcub-selection-bar{position:fixed!important;left:50%!important;bottom:calc(18px + env(safe-area-inset-bottom))!important;transform:translateX(-50%)!important;z-index:2147483647!important;display:flex!important;align-items:center!important;gap:10px!important;max-width:calc(100vw - 24px)!important;padding:9px 10px 9px 14px!important;border-radius:10px!important;background:#191b22f2!important;color:#fff!important;font-size:12px!important;box-shadow:0 6px 24px #0005!important}#dcub-selection-bar span{overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}#dcub-selection-bar button{flex-shrink:0!important;border:0!important;border-radius:6px!important;padding:5px 8px!important;background:#ffffff29!important;color:#fff!important}
+.dcub-pickable{position:relative!important;outline:2px solid #3b489059!important;outline-offset:-2px!important;cursor:pointer!important;-webkit-tap-highlight-color:transparent!important}.dcub-pickable:after{content:attr(data-dcub-pick-label)!important;position:absolute!important;right:8px!important;top:50%!important;transform:translateY(-50%)!important;z-index:2147483644!important;padding:4px 7px!important;border-radius:5px!important;background:#3b4890eb!important;color:#fff!important;font-size:10px!important;font-weight:700!important;pointer-events:none!important}
+#dcub-toast{position:fixed!important;left:50%!important;bottom:calc(72px + env(safe-area-inset-bottom))!important;transform:translateX(-50%)!important;z-index:2147483647!important;padding:9px 14px!important;border-radius:8px!important;background:#141414eb!important;color:#fff!important;font-size:13px!important;white-space:nowrap!important}
+@media(prefers-color-scheme:dark){.dcub-box{background:#252525!important;color:#eee!important}.dcub-box header,.dcub-box footer,.dcub-pick-section,.dcub-entry,.dcub-item{border-color:#444!important}#dcub-pick-user{background:#303138!important;color:#eee!important;border-color:#565a68!important}#dcub-type,#dcub-input{background:#303030!important;color:#eee!important;border-color:#5b5d65!important}.dcub-item button,.dcub-box footer button{background:#333!important;color:#eee!important;border-color:#666!important}}`;document.documentElement.appendChild(s);
+}
+async function init(){
+  const b=bridgeData();if(b&&location.hostname==='gall.dcinside.com'){await runBridge(b);return}
+  if(!document.body){document.addEventListener('DOMContentLoaded',init,{once:true});return}
+  sync();css();panel();gear();scan();document.addEventListener('click',selectClick,true);
+  new MutationObserver(ms=>{if(ms.some(m=>[...m.addedNodes].some(n=>n.nodeType===1))){clearTimeout(timer);timer=setTimeout(scan,100)}}).observe(document.documentElement,{childList:true,subtree:true});
+  setInterval(scan,mobile?2500:5000);console.info(`[DCUB] v${V}`);
+}
+init();
 })();
