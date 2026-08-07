@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DCInside User Block
 // @namespace    https://github.com/jupia389-rgb/suking
-// @version      2.1.2
+// @version      2.1.3
 // @description  디시인사이드 사용자 차단 - 단일 파일 자동 업데이트 버전
 // @match        https://gall.dcinside.com/*
 // @match        https://m.dcinside.com/*
