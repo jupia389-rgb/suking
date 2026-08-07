@@ -1,0 +1,53 @@
+name: Build userscript
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'DCInside_User_Block.header.js'
+      - 'DCInside_User_Block.core.js'
+      - '.github/workflows/build-userscript.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build self-contained userscript
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const zlib = require('zlib');
+
+          const header = fs.readFileSync('DCInside_User_Block.header.js', 'utf8').trimEnd();
+          const coreFile = fs.readFileSync('DCInside_User_Block.core.js', 'utf8');
+
+          let body = coreFile;
+          const compressed = coreFile.match(/const b64='([^']+)'/);
+          if (compressed) {
+            body = zlib.gunzipSync(Buffer.from(compressed[1], 'base64')).toString('utf8');
+          }
+
+          fs.writeFileSync(
+            'DCInside_User_Block.user.js',
+            `${header}\n\n${body.trimStart()}\n`,
+            'utf8'
+          );
+          fs.writeFileSync('DCInside_User_Block.meta.js', `${header}\n`, 'utf8');
+          NODE
+
+      - name: Commit generated files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add DCInside_User_Block.user.js DCInside_User_Block.meta.js
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'Build bundled userscript 2.1.2'
+          git push
